@@ -1,0 +1,15 @@
+/build/
+/tools/
+__pycache__/
+*.pyc
+/vmware/*.log
+/vmware/*.nvram
+/vmware/*.vmxf
+/vmware/*.vmsd
+/vmware/*.vmem
+/vmware/*.vmss
+/vmware/*.lck/
+/vmware/caches/
+/vmware/*.scoreboard
+/vmware/*.vmdk
+/vmware/NeuroOS.vmx
