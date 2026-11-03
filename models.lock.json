@@ -1,0 +1,21 @@
+{
+  "stories260k": {
+    "repository": "https://huggingface.co/karpathy/tinyllamas",
+    "revision": "0bd21da7698eaf29a0d7de3992de8a46ef624add",
+    "license": "MIT (model card)",
+    "files": {
+      "stories260K.bin": {
+        "bytes": 1056540,
+        "sha256": "b0a507e7ad0f626624f17112325e66691f9076d622e1d3274d103d00299f2696"
+      },
+      "tok512.bin": {
+        "bytes": 6227,
+        "sha256": "037cb335abb25d1fa9e8ecae30ed2a3a8ace9302862ebcdc05d51a6bbb10c312"
+      },
+      "readme.md": {
+        "bytes": 2804,
+        "sha256": "b743d79e10d9fdd57686aaef8fbb8ac337672dc0e098f9aebe672e4faea06ba4"
+      }
+    }
+  }
+}

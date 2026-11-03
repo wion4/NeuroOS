@@ -168,7 +168,7 @@ int user_main(const char *args) {
     if (call3(9, 3, 0x1f7, 0) != -1)
         return 4;
     if (call3(11, 0, (uintptr_t)buffer, 0) != -1 || call3(12, 1, 0, 0) != -1 ||
-        call3(13,0,0,0)!=-1)
+        call3(13, 0, 0, 0) != -1 || call3(14, 0, 0, 0) != -1 || call3(17, 3, ~0ull, 0) != -1)
         return 5; /* Ordinary NOS files never inherit desktop/input rights. */
     say("C FILE LIBRARY PASS\n");
     return 0;

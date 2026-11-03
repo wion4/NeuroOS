@@ -14,3 +14,8 @@ The following bundled components retain their own licenses and notices:
 These third-party licenses are not replaced or restricted by the statement
 about the original NeuroOS code above. Build tools/emulators and virtual-machine
 user data are not part of this source publication.
+
+* llama2.c neural/tokenizer code: `vendor/llama2c/LICENSE` (MIT), pinned upstream
+  source in that directory. The optional stories260K weights/tokenizer are
+  declared MIT by their publisher's preserved `MODEL-CARD.md`; download locations
+  and immutable hashes are in `models.lock.json`. Weights are not stored in Git.

@@ -56,6 +56,10 @@ static void execute(char *line) {
         (void)kernel_compile(arg);
         return;
     }
+    if (same(line, "ai") || same(line, "ai-trace")) {
+        (void)kernel_ai(arg, same(line, "ai-trace"));
+        return;
+    }
     if (same(line, "fs3test")) {
         (void)kernel_fs3_test(arg);
         return;
@@ -123,11 +127,25 @@ static void execute(char *line) {
         console_write("cc SOURCE.c OUTPUT.nos - native C compiler\n");
         console_write("install-sdk - install C headers and static library\n");
         console_write("desktop - open the graphical desktop\n");
+#if NEUROOS_AI_DEMO
+        console_write("ai PROMPT / ai-trace PROMPT / ai-reset - offline text demo\n");
+#endif
     } else if (same(line, "info")) {
-        console_write("NeuroOS " NEUROOS_VERSION " - native x86-64 kernel\nRing3 tasks / timer scheduler / "
-                      "restricted IPC\nUser file service / persistent snapshots / no AI yet\n");
+        console_write("NeuroOS " NEUROOS_VERSION
+                      " - native x86-64 kernel\nRing3 tasks / timer scheduler / "
+                      "restricted IPC\nUser file service / persistent snapshots\n");
+#if NEUROOS_AI_DEMO
+        console_write("Experimental offline CPU inference / isolated user runtime\n");
+#else
+        console_write("Optional AI demo not bundled in this image\n");
+#endif
     } else if (same(line, "install-sdk")) {
         (void)kernel_install_sdk();
+    } else if (same(line, "ai-reset")) {
+        console_write(process_ai_reset() ? "AI RUNTIME RESET\n" : "AI RESET FAILED\n");
+    } else if (same(line, "ai-fault")) {
+        process_ai_inject_fault();
+        console_write("AI FAULT ARMED\n");
     } else if (same(line, "restartfs")) {
         (void)kernel_restart_filesystem();
     } else if (same(line, "iofaulttest")) {

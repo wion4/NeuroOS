@@ -40,6 +40,10 @@ def verify_vendor():
         path=ROOT/'vendor/tinycc'/name
         if hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
             raise RuntimeError(f'Vendor checksum mismatch: {path}')
+    for name,expected in lock.get('llama2c',{}).get('sha256',{}).items():
+        path=ROOT/'vendor/llama2c'/name
+        if hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
+            raise RuntimeError(f'Vendor checksum mismatch: {path}')
 
 
 def build(test=False, fault=0):
@@ -50,11 +54,14 @@ def build(test=False, fault=0):
     fs3_test=fs3 and os.environ.get('NEUROOS_FS3_TEST')=='1'
     bootstrap_sdk=os.environ.get('NEUROOS_BOOTSTRAP_SDK')=='1'
     desktop=os.environ.get('NEUROOS_DESKTOP')=='1'
+    ai_demo=os.environ.get('NEUROOS_AI_DEMO')=='1'
+    if ai_demo and fs3_test:raise RuntimeError('AI demo and FS3 stress use separate test images')
     variant = f'fault-{fault}' if fault else 'test' if test else 'normal'
     if not fs3:variant+='-fs2'
     if fs3_test:variant+='-fs3-test'
     if bootstrap_sdk:variant+='-bootstrap'
     if desktop:variant+='-desktop'
+    if ai_demo:variant+='-ai'
     target = ROOT / 'build' / variant
     esp = target / 'esp'
     (esp / 'EFI' / 'BOOT').mkdir(parents=True, exist_ok=True)
@@ -73,6 +80,7 @@ def build(test=False, fault=0):
     flags.append(f'-DNEUROOS_FS3_TEST={int(fs3_test)}')
     flags.append(f'-DNEUROOS_BOOTSTRAP_SDK={int(bootstrap_sdk)}')
     flags.append(f'-DNEUROOS_DESKTOP={int(desktop)}')
+    flags.append(f'-DNEUROOS_AI_DEMO={int(ai_demo)}')
     elf = esp / 'boot' / 'kernel.elf'
     objects = []
     for source in ['main.c', 'memory.c', 'exceptions.c', 'entry.S', 'runtime.c',
@@ -87,7 +95,13 @@ def build(test=False, fault=0):
                     *objects, '-o', str(elf)], cwd=ROOT, check=True)
     user_flags=[f for f in flags if not f.startswith('-mcmodel=') and f!='-mgeneral-regs-only']
     user_flags+=['-mcmodel=small','-mno-avx','-fno-builtin','-Iuser']
-    apps=['ramfs','fsclient','filedemo','libcdemo','floatdemo','desktop']+(['fs3demo'] if fs3_test else [])
+    if ai_demo:
+        for name,path in [('ai_prepare','ports/llama2c/prepare.py'),('ai_pack','scripts/make-ai-pack.py')]:
+            spec=importlib.util.spec_from_file_location(name,ROOT/path)
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            if name=='ai_prepare':module.prepare(ROOT,target)
+            else:module.build(ROOT,target)
+    apps=['ramfs','fsclient','filedemo','libcdemo','floatdemo','desktop']+(['fs3demo'] if fs3_test else [])+(['airuntime','aiclient'] if ai_demo else [])
     for app in apps:
         installable=app in ('filedemo','libcdemo','floatdemo','fs3demo')
         app_objects=[]
@@ -98,6 +112,8 @@ def build(test=False, fault=0):
         if installable:sources+=['user/file.c','user/heap.c','user/stdio.c']
         if app=='desktop':sources+=['user/file.c','user/heap.c','user/format.c','user/string.c','user/stdio.c',
                                     'user/text.c','user/keyboard.c']
+        if app=='airuntime':sources+=['user/ai_core.c','ports/llama2c/math.c','user/heap.c','user/stdio.c',
+                                     'user/format.c','user/string.c','user/stdlib.c','user/file.c']
         if app=='filedemo':sources+=['tests/user_io.c']
         if app=='libcdemo':sources+=['user/format.c','user/string.c','user/setjmp.S','user/stdlib.c',
                                     'tests/user_libc.c','tests/user_jmp.S']
@@ -105,6 +121,7 @@ def build(test=False, fault=0):
         for source in sources:
             obj=target/(app+'-'+Path(source).stem+'.o')
             extra=['-Os','-ffunction-sections','-fdata-sections'] if installable else []
+            if app=='airuntime':extra+=['-I'+str(target),'-Wno-sign-compare','-Wno-unknown-pragmas']
             if source=='user/strtod.c' or source.startswith('vendor/musl-'):
                 extra+=['-Iports/musl/include','-Iuser/libc','-Dhidden=']
             if source.startswith('vendor/musl-'):extra+=['-Wno-parentheses','-Wno-sign-compare']
@@ -167,11 +184,16 @@ def build(test=False, fault=0):
     if fs3_test:
         with (esp/'limine.conf').open('a') as config:
             config.write('    module_path: boot():/boot/fs3demo.nos\n')
+    if ai_demo:
+        with (esp/'limine.conf').open('a') as config:
+            for name in ('airuntime.nos','aiclient.nos','ai.pack'):
+                config.write('    module_path: boot():/boot/'+name+'\n')
     manifest = {
         'variant': variant,
         'filesystem_backend':backend,
         'bootstrap_sdk':bootstrap_sdk,
         'desktop':desktop,
+        'ai_demo':ai_demo,
         'clang': subprocess.check_output([clang, '--version'], text=True).splitlines()[0],
         'linker': subprocess.check_output([linker, '--version'], text=True).strip(),
         'kernel_sha256': hashlib.sha256(elf.read_bytes()).hexdigest(),

@@ -18,4 +18,10 @@ void process_filesystem_fault_after_io(unsigned operations);
 bool process_filesystem_restart(void);
 bool process_run_file(const void *file, uint64_t size, const char *arguments, bool file_access);
 bool process_run_desktop(const void *file, uint64_t size);
+struct ai_session;
+bool process_ai_config(const void *server, uint64_t server_bytes, const void *client,
+                       uint64_t client_bytes, const void *model, uint64_t model_bytes);
+bool process_ai_request(struct ai_session *session);
+bool process_ai_reset(void);
+void process_ai_inject_fault(void);
 #endif

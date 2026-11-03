@@ -2,6 +2,7 @@
 #include "desktop.h"
 #include "../kernel/version.h"
 #include "abi.h"
+#include "ai.h"
 #include "cyrillic.h"
 #include "file.h"
 #include "font.h"
@@ -18,17 +19,19 @@
 #define INK 0xe5edf4u
 #define MUTED 0x93a6b8u
 #define EDGE 0x2c4052u
-enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, APP_COUNT };
-static const char *titles[] = {"Welcome", "Files", "Notes", "Calculator", "Appearance", "Programs"};
-static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps"};
+enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, AI, APP_COUNT };
+static const char *titles[] = {"Welcome",    "Files",    "Notes",       "Calculator",
+                               "Appearance", "Programs", "AI text demo"};
+static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps", "AI"};
 struct window {
     int x, y, w, h;
     bool open;
 };
 static struct window windows[APP_COUNT] = {{132, 78, 620, 420, true},   {130, 78, 620, 430, false},
                                            {150, 90, 600, 420, false},  {340, 85, 365, 425, false},
-                                           {220, 110, 490, 365, false}, {140, 85, 620, 425, false}};
-static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5}, active;
+                                           {220, 110, 490, 365, false}, {140, 85, 620, 425, false},
+                                           {136, 85, 620, 430, false}};
+static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5, 6}, active;
 static uint32_t *pixels, accent = 0x51e1ae;
 static const uint32_t accents[] = {0x51e1ae, 0x6baeff, 0xc09aff, 0xffbf69};
 static unsigned theme;
@@ -66,6 +69,10 @@ static char program_name[16] = "hello.nos", program_arguments[80];
 static bool program_files, program_arguments_focus = true, program_has_result;
 static unsigned program_scroll;
 static struct desktop_launch_result program_result;
+static char ai_prompt[56] = "Once upon a time";
+static struct ai_session ai_result;
+static bool ai_has_result;
+static unsigned ai_scroll;
 static void paint(void);
 static void message(const char *s) {
     snprintf(notice, sizeof(notice), "%s", s);
@@ -648,6 +655,92 @@ static void draw_programs(struct window *w) {
     button(x + 400, y + 326, 76, "Up", false);
     button(x + 486, y + 326, 76, "Down", false);
 }
+static void ai_action(bool unload) {
+    struct ai_request request = {.op = unload ? AI_UNLOAD : AI_GENERATE, .steps = 48};
+    snprintf(request.prompt, sizeof(request.prompt), "%s", ai_prompt);
+    ai_has_result = false;
+    message(unload ? "Unloading cached AI model..."
+                   : "Generating locally on CPU. This is a tiny English text demo.");
+    paint();
+    long e = call3(14, (uintptr_t)&request, (uintptr_t)&ai_result, sizeof(request));
+    ai_scroll = 0;
+    if (e < 0 || ai_result.status) {
+        message("AI request failed. Desktop and notes are preserved.");
+        say("AI GUI ERROR\n");
+        return;
+    }
+    ai_has_result = !unload;
+    message(unload ? "AI model unloaded. Its process memory was released."
+                   : "Generated offline. This test model has no access to your files.");
+    say(unload ? "AI GUI UNLOADED\n" : "AI GUI COMPLETE\n");
+}
+static void ai_key(uint32_t key) {
+    unsigned length = (unsigned)strlen(ai_prompt);
+    if (key == '\n') {
+        ai_action(false);
+        return;
+    }
+    if (key == '\b' && length)
+        ai_prompt[length - 1] = 0;
+    else if (key >= 32 && key <= 126 && length < 55) {
+        ai_prompt[length] = (char)key;
+        ai_prompt[length + 1] = 0;
+    } else if (key > 127)
+        message("The tiny test model uses English prompts. Switch to EN above.");
+    redraw = true;
+}
+static unsigned ai_text_layout(struct window *w, bool draw) {
+    unsigned row = 0, col = 0;
+    int x = w->x + 28, y = w->y + 172;
+    for (unsigned i = 0; i < ai_result.bytes; ++i) {
+        char ch = ai_result.text[i];
+        if (ch == '\n') {
+            ++row;
+            col = 0;
+            continue;
+        }
+        if (ch == ' ' && !col)
+            continue;
+        if (col && ch != ' ' &&
+            (!i || ai_result.text[i - 1] == ' ' || ai_result.text[i - 1] == '\n')) {
+            unsigned word = 0;
+            while (i + word < ai_result.bytes && ai_result.text[i + word] != ' ' &&
+                   ai_result.text[i + word] != '\n')
+                ++word;
+            if (word <= 46 && col + word > 46) {
+                ++row;
+                col = 0;
+            }
+        }
+        if (draw && row >= ai_scroll && row < ai_scroll + 11) {
+            char piece[2] = {ch, 0};
+            text(x + (int)col * 12, y + (int)(row - ai_scroll) * 17, piece, 2, INK);
+        }
+        if (++col == 46) {
+            ++row;
+            col = 0;
+        }
+    }
+    return row + 1;
+}
+static void draw_ai(struct window *w) {
+    int x = w->x + 20, y = w->y + 50;
+    text(x, y + 4, "English continuation model / experimental / not a chat assistant", 1, MUTED);
+    rect(x, y + 28, w->w - 40, 30, BG);
+    text(x + 10, y + 39, ai_prompt, 1, INK);
+    unsigned length = (unsigned)strlen(ai_prompt);
+    rect(x + 10 + (int)length * 6, y + 35, 1, 15, accent);
+    button(x, y + 70, 110, "Generate", true);
+    button(x + 122, y + 70, 100, "Unload", false);
+    rect(x, y + 112, w->w - 40, 200, BG);
+    if (ai_has_result) {
+        (void)ai_text_layout(w, true);
+    } else
+        text(x + 12, y + 132, "No generated text yet.", 1, MUTED);
+    text(x, y + 337, "Offline CPU / 260K parameters / no file or disk-port rights", 1, MUTED);
+    button(x + 400, y + 324, 76, "Up", false);
+    button(x + 486, y + 324, 76, "Down", false);
+}
 static void draw_home(struct window *w) {
     int x = w->x + 26, y = w->y + 68;
     text(x, y, "Your space.", 3, INK);
@@ -840,16 +933,21 @@ static void paint(void) {
             draw_appearance(w);
         if (id == PROGRAMS)
             draw_programs(w);
+        if (id == AI)
+            draw_ai(w);
     }
     rect(0, 533, W, 67, 0x111e2b);
     line(0, 533, W, EDGE);
-    for (int id = 0; id < APP_COUNT; ++id) {
+    for (int id = 0; id <= PROGRAMS; ++id) {
         int x = 18 + id * 108;
         if (windows[id].open)
             rect(x, 542, 96, 47, id == active ? EDGE : PANEL);
         icon(id, x + 8, 547, accent);
         text(x + 43, 558, labels[id], 1, INK);
     }
+#if NEUROOS_AI_DEMO
+    button(414, 3, 96, "AI demo", false);
+#endif
     button(525, 3, 70, layout.russian ? "RU" : "EN", false);
     button(685, 550, 96, "Console", false);
     text(16, 516, notice, 1, MUTED);
@@ -874,6 +972,12 @@ static void paint(void) {
     redraw = false;
 }
 static void click(void) {
+#if NEUROOS_AI_DEMO
+    if (!dialog && inside(414, 3, 96, 28)) {
+        front(AI);
+        return;
+    }
+#endif
     if (!dialog && inside(525, 3, 70, 28)) {
         layout.russian = !layout.russian;
         redraw = true;
@@ -888,7 +992,7 @@ static void click(void) {
         return;
     }
     if (input.y >= 533) {
-        for (int i = 0; i < APP_COUNT; ++i)
+        for (int i = 0; i <= PROGRAMS; ++i)
             if (inside(18 + i * 108, 542, 96, 47)) {
                 if (i == FILES)
                     refresh_files();
@@ -977,6 +1081,20 @@ static void click(void) {
                 if (!(input.modifiers & INPUT_SHIFT))
                     document.now.anchor = cursor;
                 selecting = true;
+            }
+        } else if (id == AI) {
+            if (inside(x, y + 70, 110, 28))
+                ai_action(false);
+            else if (inside(x + 122, y + 70, 100, 28))
+                ai_action(true);
+            else if (inside(x + 400, y + 324, 76, 28))
+                ai_scroll = ai_scroll > 10 ? ai_scroll - 10 : 0;
+            else if (inside(x + 486, y + 324, 76, 28)) {
+                unsigned rows = ai_text_layout(w, false);
+                unsigned limit = rows > 11 ? rows - 11 : 0;
+                ai_scroll += 10;
+                if (ai_scroll > limit)
+                    ai_scroll = limit;
             }
         } else if (id == PROGRAMS) {
             if (inside(x + 38, y, 185, 28))
@@ -1097,6 +1215,8 @@ int user_main(void) {
                 redraw = true;
             } else if (windows[active].open && active == NOTES)
                 note_key(key);
+            else if (windows[active].open && active == AI)
+                ai_key(key);
             else if (windows[active].open && active == PROGRAMS)
                 program_key(key);
             else if (windows[active].open && active == CALC)

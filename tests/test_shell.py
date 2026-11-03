@@ -84,6 +84,32 @@ def main():
                 def success(message):
                     (target/'shell-test.json').write_text(json.dumps({'passed':True,'scenario':sys.argv[1:]})+'\n')
                     print(message)
+                if '--ai' in sys.argv:
+                    assert b'AI DEMO MODULES AVAILABLE' in log.read_bytes()
+                    cases=json.loads((ROOT/'build/ai-host/oracle-result.json').read_text())['cases']
+                    command('write sentinel ai cannot change this',b'WROTE 21 BYTES')
+                    baseline=command('mem',b'HEAP FREE BYTES')
+                    def infer(prompt,index):
+                        data=command('ai-trace '+prompt,b'AI DEMO COMPLETE',timeout=60)
+                        trace=re.search(rb'AI TOKENS:([^\r\n]+)',data)
+                        assert trace and [int(x) for x in trace[1].split()]==cases[index]['trace'],data
+                        assert cases[index]['text'].encode().replace(b'\n',b'\r\n') in data,data
+                        return data
+                    infer('Once upon a time',1)
+                    warmed=command('mem',b'HEAP FREE BYTES')
+                    infer('Once upon a time',1)
+                    repeated=command('mem',b'HEAP FREE BYTES')
+                    assert re.search(rb'PAGES FREE (\d+)',warmed)[1]==re.search(rb'PAGES FREE (\d+)',repeated)[1]
+                    command('ai-fault',b'AI FAULT ARMED')
+                    failed=command('ai test',b'AI SERVICE STOPPED - KERNEL ALIVE')
+                    assert b'TASK 0 FAULT 14 CONTAINED' in failed
+                    infer('The cat',2)
+                    command('ai-reset',b'AI RUNTIME RESET')
+                    final=command('mem',b'HEAP FREE BYTES')
+                    assert re.search(rb'PAGES FREE (\d+)',baseline)[1]==re.search(rb'PAGES FREE (\d+)',final)[1],(baseline,final)
+                    command('cat sentinel',b'ai cannot change this')
+                    success('PASS: real offline inference matches host tokens, warm cache, rights, contained fault/restart and complete cleanup')
+                    return
                 if '--sdk-auto-first' in sys.argv:
                     assert b'SDK INSTALLED 21 FILES' in log.read_bytes()
                     command('stat libnos.a',b'BYTES');command('stat stdio.h',b'BYTES')

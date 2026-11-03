@@ -3,4 +3,5 @@
 vendor/limine/* -text whitespace=cr-at-eol
 vendor/tinycc/** -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,cr-at-eol
 vendor/musl-1.2.5/** -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,cr-at-eol
+vendor/llama2c/** -text whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,cr-at-eol
 *.EFI binary

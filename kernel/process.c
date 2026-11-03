@@ -1,4 +1,5 @@
 #include "process.h"
+#include "../user/ai.h"
 #include "../user/desktop.h"
 #include "../user/fs.h"
 #include "alloc.h"
@@ -44,7 +45,14 @@ static struct desktop_launch_result launch_result;
 static struct desktop_launch_result *captured_output;
 static uint64_t launch_destination;
 static bool launch_pending;
+static bool pending_ai;
+static struct ai_session desktop_ai;
 static struct task parked_server;
+static struct task parked_ai;
+static const void *ai_server_code, *ai_client_code, *ai_model;
+static uint64_t ai_server_bytes, ai_client_bytes, ai_model_bytes;
+static unsigned ai_restarts;
+static bool ai_started;
 void process_filesystem_inject_fault(void) {
     if (parked_server.space.root)
         parked_server.context.rip = 0;
@@ -134,7 +142,7 @@ static void syscall(struct task *task) {
         for (uint64_t i = 0; i < f->rsi; ++i)
             if ((text[i] >= 32 && text[i] <= 126) || text[i] == '\n') {
                 console_char(text[i]);
-                if (captured_output && !(task->caps[3].rights & 4)) {
+                if (captured_output && !task->caps[3].rights) {
                     if (captured_output->bytes + 1 < sizeof(captured_output->output))
                         captured_output->output[captured_output->bytes++] = text[i];
                     else
@@ -307,7 +315,61 @@ static void syscall(struct task *task) {
         }
         launch_destination = f->rsi;
         launch_pending = true;
+        pending_ai = false;
         task->state = SUSPENDED;
+        break;
+    }
+    case 14: {
+        if (!task->desktop) {
+            f->rax = (uint64_t)-1;
+            break;
+        }
+        struct ai_request request;
+        if (f->rdx != sizeof(request) ||
+            !user_copy_from(&task->space, &request, f->rdi, sizeof(request))) {
+            f->rax = (uint64_t)-14;
+            break;
+        }
+        if ((request.op != AI_GENERATE && request.op != AI_UNLOAD) || request.prompt[55] ||
+            (request.op == AI_GENERATE && (!request.steps || request.steps > AI_STEPS))) {
+            f->rax = (uint64_t)-22;
+            break;
+        }
+        if (current != 1 || endpoints[0].count || endpoints[1].count ||
+            (tasks[0].state == READY && !tasks[0].ipc_idle)) {
+            f->rax = (uint64_t)-16;
+            break;
+        }
+        desktop_ai = (struct ai_session){.request = request};
+        if (!user_copy_to(&task->space, f->rsi, &desktop_ai, sizeof(desktop_ai))) {
+            f->rax = (uint64_t)-14;
+            break;
+        }
+        launch_destination = f->rsi;
+        launch_pending = true;
+        pending_ai = true;
+        task->state = SUSPENDED;
+        break;
+    }
+    case 17: {
+        if (f->rdi != 3 || task->caps[3].endpoint != 3 || task->caps[3].rights != 16 || !ai_model) {
+            f->rax = (uint64_t)-1;
+            break;
+        }
+        if (f->rsi == ~0ull) {
+            f->rax = ai_model_bytes;
+            break;
+        }
+        if (f->rsi > ai_model_bytes) {
+            f->rax = (uint64_t)-22;
+            break;
+        }
+        uint64_t n = ai_model_bytes - f->rsi;
+        if (n > 4096)
+            n = 4096;
+        f->rax = user_copy_to(&task->space, f->rdx, (const uint8_t *)ai_model + f->rsi, (size_t)n)
+                     ? n
+                     : (uint64_t)-14;
         break;
     }
     default:
@@ -688,17 +750,26 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
            runs as an ordinary task with only explicitly requested FS rights. */
         launch_pending = false;
         desktop_launch = false;
-        captured_output = &launch_result;
-        (void)filesystem_execute(launch_request.name, launch_request.arguments,
-                                 (launch_request.flags & NOS_LAUNCH_FILES) != 0);
-        captured_output = 0;
+        if (pending_ai) {
+            if (desktop_ai.request.op == AI_UNLOAD)
+                desktop_ai.status = process_ai_reset() ? 0 : -16;
+            else if (!process_ai_request(&desktop_ai))
+                desktop_ai.status = -5;
+        } else {
+            captured_output = &launch_result;
+            (void)filesystem_execute(launch_request.name, launch_request.arguments,
+                                     (launch_request.flags & NOS_LAUNCH_FILES) != 0);
+            captured_output = 0;
+        }
         desktop_launch = true;
         tasks[1] = suspended_desktop;
         suspended_desktop = (struct task){0};
         tasks[1].state = READY;
         tasks[1].ticks = 0;
         tasks[1].context.rax =
-            user_copy_to(&tasks[1].space, launch_destination, &launch_result, sizeof(launch_result))
+            user_copy_to(&tasks[1].space, launch_destination,
+                         pending_ai ? (const void *)&desktop_ai : (const void *)&launch_result,
+                         pending_ai ? sizeof(desktop_ai) : sizeof(launch_result))
                 ? 0
                 : (uint64_t)-14;
         tasks[0] = parked_server;
@@ -759,5 +830,108 @@ bool process_run_desktop(const void *file, uint64_t size) {
     desktop_launch = true;
     bool ok = process_run_file(file, size, "", true);
     desktop_launch = false;
+    return ok;
+}
+bool process_ai_config(const void *server, uint64_t server_bytes, const void *client,
+                       uint64_t client_bytes, const void *model, uint64_t model_bytes) {
+    if (running || parked_ai.space.root || !server || !client || !model || !server_bytes ||
+        !client_bytes || !model_bytes || model_bytes > 2 * 1024 * 1024)
+        return false;
+    ai_server_code = server;
+    ai_server_bytes = server_bytes;
+    ai_client_code = client;
+    ai_client_bytes = client_bytes;
+    ai_model = model;
+    ai_model_bytes = model_bytes;
+    return true;
+}
+bool process_ai_reset(void) {
+    if (running)
+        return false;
+    user_space_destroy(&parked_ai.space);
+    parked_ai = (struct task){0};
+    ai_restarts = 0;
+    ai_started = false;
+    return true;
+}
+void process_ai_inject_fault(void) {
+    if (parked_ai.space.root)
+        parked_ai.context.rip = 0;
+}
+static bool create_ai(void) {
+    if (!ai_server_code)
+        return false;
+    if (ai_started) {
+        if (ai_restarts >= 3) {
+            console_write("AI RESTART LIMIT - USE ai-reset\n");
+            return false;
+        }
+        ++ai_restarts;
+    }
+    ai_started = true;
+    uint64_t entry;
+    parked_ai = (struct task){0};
+    if (!user_space_elf(&parked_ai.space, ai_server_code, ai_server_bytes, &entry))
+        return false;
+    fpu_init(&parked_ai.fp);
+    parked_ai.context = (struct cpu_context){
+        .rip = entry, .cs = 0x33, .ss = 0x2b, .flags = 0x202, .rsp = USER_ELF_STACK_TOP - 16};
+    parked_ai.caps[1] = (struct capability){0, RECEIVE};
+    parked_ai.caps[2] = (struct capability){1, SEND};
+    parked_ai.caps[3] = (struct capability){3, 16};
+    return true;
+}
+bool process_ai_request(struct ai_session *session) {
+    uint64_t flags;
+    __asm__ volatile("pushfq;popq %0;cli" : "=r"(flags)::"memory");
+    bool ok = false;
+    if (running || !ai_server_code || (!parked_ai.space.root && !create_ai()))
+        goto done;
+    tasks[0] = parked_ai;
+    tasks[0].ticks = 0;
+    tasks[1] = (struct task){0};
+    uint64_t entry;
+    if (!user_space_elf(&tasks[1].space, ai_client_code, ai_client_bytes, &entry))
+        goto done;
+    const uint64_t boot = USER_STACK + 0x100;
+    if (!user_copy_to(&tasks[1].space, boot, session, sizeof(*session))) {
+        user_space_destroy(&tasks[1].space);
+        goto done;
+    }
+    fpu_init(&tasks[1].fp);
+    tasks[1].context = (struct cpu_context){.rip = entry,
+                                            .cs = 0x33,
+                                            .ss = 0x2b,
+                                            .flags = 0x202,
+                                            .rsp = USER_ELF_STACK_TOP - 16,
+                                            .rdi = boot};
+    tasks[1].caps[1] = (struct capability){0, SEND};
+    tasks[1].caps[2] = (struct capability){1, RECEIVE};
+    for (unsigned i = 0; i < 2; ++i)
+        endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+    task_count = 2;
+    budget = 1000;
+    interactive = true;
+    current = 0;
+    running = true;
+    fpu_begin();
+    fpu_restore(&tasks[0].fp);
+    exceptions_kernel_stack((uint64_t)&stacks[0][sizeof(stacks[0])]);
+    paging_switch(tasks[0].space.root);
+    process_enter(&tasks[0].context, &saved_kernel_rsp);
+    fpu_end();
+    ok = tasks[1].state == EXITED && !tasks[1].status && tasks[0].state == READY &&
+         !endpoints[0].count && !endpoints[1].count &&
+         user_copy_from(&tasks[1].space, session, boot, sizeof(*session));
+    parked_ai = tasks[0];
+    if (!ok) {
+        user_space_destroy(&parked_ai.space);
+        console_write("AI SERVICE STOPPED - KERNEL ALIVE\n");
+    }
+    user_space_destroy(&tasks[1].space);
+done:
+    interactive = false;
+    if (flags & 512)
+        __asm__ volatile("sti" ::: "memory");
     return ok;
 }

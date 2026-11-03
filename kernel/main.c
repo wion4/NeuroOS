@@ -1,3 +1,4 @@
+#include "../user/ai.h"
 #include "../user/fs.h"
 #include "alloc.h"
 #include "display.h"
@@ -316,6 +317,39 @@ bool kernel_desktop(void) {
     console_clear();
     return ok;
 }
+bool kernel_ai(const char *prompt, bool trace) {
+    struct ai_session session = {.request = {.op = AI_GENERATE, .steps = 48}};
+    unsigned length = 0;
+    while (prompt[length] && length < 55) {
+        session.request.prompt[length] = prompt[length];
+        ++length;
+    }
+    if (prompt[length]) {
+        console_write("AI DEMO: maximum prompt is 55 ASCII bytes\n");
+        return false;
+    }
+    if (!process_ai_request(&session)) {
+        console_write("AI DEMO UNAVAILABLE OR SERVICE FAILED\n");
+        return false;
+    }
+    if (session.status) {
+        console_write("AI REQUEST REJECTED\n");
+        return false;
+    }
+    console_write("AI TEXT: ");
+    console_write(session.text);
+    console_write("\n");
+    if (trace) {
+        console_write("AI TOKENS:");
+        for (unsigned i = 0; i < session.trace_count; ++i) {
+            console_char(' ');
+            console_number(session.trace[i]);
+        }
+        console_write("\n");
+    }
+    console_write("AI DEMO COMPLETE\n");
+    return true;
+}
 bool kernel_install_program(const char *name) {
     const char *expected = "hello.nos";
     unsigned module = 2, n = 0;
@@ -553,6 +587,16 @@ __attribute__((noreturn)) void kmain(void) {
 #endif
     }
     __asm__ volatile("sti" : : : "memory");
+#if NEUROOS_AI_DEMO
+    const void *ai_server, *ai_client, *ai_pack;
+    uint64_t ai_server_size, ai_client_size, ai_pack_size;
+    bool ai_available = kernel_boot_module(9, &ai_server, &ai_server_size) &&
+                        kernel_boot_module(10, &ai_client, &ai_client_size) &&
+                        kernel_boot_module(11, &ai_pack, &ai_pack_size) &&
+                        process_ai_config(ai_server, ai_server_size, ai_client, ai_client_size,
+                                          ai_pack, ai_pack_size);
+    console_write(ai_available ? "AI DEMO MODULES AVAILABLE\n" : "AI DEMO MODULES UNAVAILABLE\n");
+#endif
 #if NEUROOS_DESKTOP
     (void)kernel_desktop();
 #endif
