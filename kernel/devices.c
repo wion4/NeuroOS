@@ -6,6 +6,8 @@ static int mouse_x = 400, mouse_y = 300;
 static unsigned mouse_buttons, mouse_sequence, mouse_index;
 static uint8_t mouse_packet[3];
 static bool mouse_ready;
+static uint32_t desktop_scan, desktop_modifiers;
+static unsigned keyboard_sequence;
 static void wait_io(void) { io_out(0x80, 0); }
 void timer_irq(void) {
     ++ticks;
@@ -142,7 +144,7 @@ static void mouse_byte(uint8_t value) {
     ++mouse_sequence;
 }
 char keyboard_poll(void) {
-    static bool left_shift, right_shift, caps, control;
+    static bool left_shift, right_shift, caps, left_control, right_control, left_alt, right_alt;
     static bool extended;
     static unsigned pause_bytes;
     static const char keys[128] = {
@@ -176,8 +178,17 @@ char keyboard_poll(void) {
         extended = true;
         return 0;
     }
+    desktop_scan = code | (extended ? 0x100u : 0);
+    ++keyboard_sequence;
     if (extended) {
         extended = false;
+        if (code == 0x1d || code == 0x9d)
+            right_control = code == 0x1d;
+        if (code == 0x38 || code == 0xb8)
+            right_alt = code == 0x38;
+        desktop_modifiers = (left_shift || right_shift ? INPUT_SHIFT : 0) |
+                            (left_control || right_control ? INPUT_CONTROL : 0) |
+                            (left_alt || right_alt ? INPUT_ALT : 0) | (caps ? INPUT_CAPS : 0);
         if (code == 0x48)
             return (char)0x81;
         if (code == 0x50)
@@ -190,26 +201,23 @@ char keyboard_poll(void) {
     }
     if (code == 0x2a || code == 0xaa) {
         left_shift = code == 0x2a;
-        return 0;
-    }
-    if (code == 0x36 || code == 0xb6) {
+    } else if (code == 0x36 || code == 0xb6) {
         right_shift = code == 0x36;
-        return 0;
-    }
-    if (code == 0x3a) {
+    } else if (code == 0x3a) {
         caps = !caps;
-        return 0;
-    }
-    if (code == 0x1d || code == 0x9d) {
-        control = code == 0x1d;
-        return 0;
-    }
+    } else if (code == 0x1d || code == 0x9d)
+        left_control = code == 0x1d;
+    else if (code == 0x38 || code == 0xb8)
+        left_alt = code == 0x38;
+    desktop_modifiers = (left_shift || right_shift ? INPUT_SHIFT : 0) |
+                        (left_control || right_control ? INPUT_CONTROL : 0) |
+                        (left_alt || right_alt ? INPUT_ALT : 0) | (caps ? INPUT_CAPS : 0);
     if (code & 0x80)
         return 0;
     if (code == 1)
         return 27;
     char c = keys[code];
-    if (control && c >= 'a' && c <= 'z')
+    if ((left_control || right_control) && c >= 'a' && c <= 'z')
         return (char)(c - 'a' + 1);
     bool shift = left_shift || right_shift;
     if (c >= 'a' && c <= 'z')
@@ -226,10 +234,13 @@ char keyboard_poll(void) {
 void desktop_input_poll(struct desktop_input *input) {
     uint32_t key = 0;
     unsigned sequence = mouse_sequence;
+    unsigned keys = keyboard_sequence;
+    desktop_scan = 0;
     for (unsigned i = 0; i < 128 && (io_in(0x64) & 1); ++i) {
         key = (unsigned char)keyboard_poll();
-        if (key || mouse_sequence != sequence)
+        if (key || mouse_sequence != sequence || keyboard_sequence != keys)
             break;
     }
-    *input = (struct desktop_input){mouse_x, mouse_y, mouse_buttons, key, timer_ticks()};
+    *input = (struct desktop_input){mouse_x,       mouse_y,           mouse_buttons, key,
+                                    timer_ticks(), desktop_modifiers, desktop_scan};
 }

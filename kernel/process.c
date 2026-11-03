@@ -1,10 +1,10 @@
 #include "process.h"
+#include "../user/desktop.h"
 #include "../user/fs.h"
 #include "alloc.h"
+#include "display.h"
 #include "exceptions.h"
 #include "fpu.h"
-#include "display.h"
-#include "../user/desktop.h"
 #include "io.h"
 #include "paging.h"
 #include "shell.h"
@@ -15,7 +15,7 @@ _Static_assert(sizeof(struct cpu_context) == 176, "ASM full frame");
 #define TASKS 9
 #define SEND 1u
 #define RECEIVE 2u
-enum state { READY, EXITED, FAULTED, EXPIRED };
+enum state { READY, EXITED, FAULTED, EXPIRED, SUSPENDED };
 struct capability {
     unsigned endpoint, rights;
 };
@@ -38,6 +38,12 @@ static uint64_t mailbox, saved_kernel_rsp;
 static unsigned task_count = TASKS, budget = 8;
 static bool interactive;
 static bool desktop_launch;
+static struct task suspended_desktop;
+static struct desktop_launch_request launch_request;
+static struct desktop_launch_result launch_result;
+static struct desktop_launch_result *captured_output;
+static uint64_t launch_destination;
+static bool launch_pending;
 static struct task parked_server;
 void process_filesystem_inject_fault(void) {
     if (parked_server.space.root)
@@ -126,8 +132,15 @@ static void syscall(struct task *task) {
         console_write(": ");
         /* No terminal control sequences from a user process. */
         for (uint64_t i = 0; i < f->rsi; ++i)
-            if ((text[i] >= 32 && text[i] <= 126) || text[i] == '\n')
+            if ((text[i] >= 32 && text[i] <= 126) || text[i] == '\n') {
                 console_char(text[i]);
+                if (captured_output && !(task->caps[3].rights & 4)) {
+                    if (captured_output->bytes + 1 < sizeof(captured_output->output))
+                        captured_output->output[captured_output->bytes++] = text[i];
+                    else
+                        captured_output->truncated = 1;
+                }
+            }
         f->rax = f->rsi;
         break;
     }
@@ -228,7 +241,10 @@ static void syscall(struct task *task) {
             f->rax = USER_HEAP + (uint64_t)task->space.heap_pages * 4096;
         break;
     case 11: {
-        if (!task->desktop) { f->rax = (uint64_t)-1; break; }
+        if (!task->desktop) {
+            f->rax = (uint64_t)-1;
+            break;
+        }
         if (f->rdi == 0) {
             struct desktop_input input;
             desktop_input_poll(&input);
@@ -236,19 +252,62 @@ static void syscall(struct task *task) {
                 f->rax = (uint64_t)-14;
         } else if (f->rdi == 1)
             f->rax = (uint64_t)display_present(&task->space, f->rsi, f->rdx);
-        else f->rax = (uint64_t)-22;
+        else
+            f->rax = (uint64_t)-22;
         break;
     }
     case 12: {
-        if (!task->desktop) { f->rax = (uint64_t)-1; break; }
+        if (!task->desktop) {
+            f->rax = (uint64_t)-1;
+            break;
+        }
         /* Trusted foreground desktop sleeps with interrupts on. The filesystem
            has no pending work here: all UI file calls finish synchronously. */
-        if (f->rdi > 10) { f->rax = (uint64_t)-22; break; }
+        if (f->rdi > 10) {
+            f->rax = (uint64_t)-22;
+            break;
+        }
         task->ticks = 0;
-        if (tasks[0].ipc_idle) tasks[0].ticks = 0;
+        if (tasks[0].ipc_idle)
+            tasks[0].ticks = 0;
         uint64_t end = timer_ticks() + f->rdi;
         while (timer_ticks() < end)
             __asm__ volatile("sti; hlt; cli" ::: "memory");
+        break;
+    }
+    case 13: {
+        if (!task->desktop) {
+            f->rax = (uint64_t)-1;
+            break;
+        }
+        if (f->rdx != sizeof(launch_request) ||
+            !user_copy_from(&task->space, &launch_request, f->rdi, sizeof(launch_request))) {
+            f->rax = (uint64_t)-14;
+            break;
+        }
+        unsigned n = 0;
+        while (n < 16 && launch_request.name[n])
+            ++n;
+        if (n < 5 || n > 15 || launch_request.name[n - 4] != '.' ||
+            launch_request.name[n - 3] != 'n' || launch_request.name[n - 2] != 'o' ||
+            launch_request.name[n - 1] != 's' || launch_request.arguments[79] ||
+            launch_request.flags & ~NOS_LAUNCH_FILES) {
+            f->rax = (uint64_t)-22;
+            break;
+        }
+        if (current != 1 || tasks[0].state != READY || !tasks[0].ipc_idle || endpoints[0].count ||
+            endpoints[1].count) {
+            f->rax = (uint64_t)-16;
+            break;
+        }
+        launch_result = (struct desktop_launch_result){.kind = NOS_LAUNCH_LOAD_ERROR};
+        if (!user_copy_to(&task->space, f->rsi, &launch_result, sizeof(launch_result))) {
+            f->rax = (uint64_t)-14;
+            break;
+        }
+        launch_destination = f->rsi;
+        launch_pending = true;
+        task->state = SUSPENDED;
         break;
     }
     default:
@@ -593,7 +652,7 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         goto done;
     }
     unsigned n = 0;
-    while (arguments[n] && n < 80)
+    while (n < 80 && arguments[n])
         ++n;
     if (n == 80 || !user_copy_to(&tasks[app].space, USER_STACK + 0x100, arguments, n + 1)) {
         user_space_destroy(&tasks[app].space);
@@ -612,15 +671,68 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         for (unsigned i = 0; i < 2; ++i)
             endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
     }
-    current = 0;
-    running = true;
-    fpu_begin();
-    fpu_restore(&tasks[0].fp);
-    exceptions_kernel_stack((uint64_t)&stacks[0][sizeof(stacks[0])]);
-    paging_switch(tasks[0].space.root);
-    process_enter(&tasks[0].context, &saved_kernel_rsp);
-    fpu_end();
+    for (;;) {
+        current = tasks[0].space.root && tasks[0].state == READY ? 0 : app;
+        running = true;
+        fpu_begin();
+        fpu_restore(&tasks[current].fp);
+        exceptions_kernel_stack((uint64_t)&stacks[current][sizeof(stacks[current])]);
+        paging_switch(tasks[current].space.root);
+        process_enter(&tasks[current].context, &saved_kernel_rsp);
+        fpu_end();
+        if (!tasks[app].desktop || tasks[app].state != SUSPENDED || !launch_pending)
+            break;
+        suspended_desktop = tasks[app];
+        park_filesystem();
+        /* Preserve the desktop address space and FPU state. The bounded child
+           runs as an ordinary task with only explicitly requested FS rights. */
+        launch_pending = false;
+        desktop_launch = false;
+        captured_output = &launch_result;
+        (void)filesystem_execute(launch_request.name, launch_request.arguments,
+                                 (launch_request.flags & NOS_LAUNCH_FILES) != 0);
+        captured_output = 0;
+        desktop_launch = true;
+        tasks[1] = suspended_desktop;
+        suspended_desktop = (struct task){0};
+        tasks[1].state = READY;
+        tasks[1].ticks = 0;
+        tasks[1].context.rax =
+            user_copy_to(&tasks[1].space, launch_destination, &launch_result, sizeof(launch_result))
+                ? 0
+                : (uint64_t)-14;
+        tasks[0] = parked_server;
+        tasks[0].ticks = 0;
+        task_count = 2;
+        budget = 1000;
+        interactive = true;
+        for (unsigned i = 0; i < 2; ++i)
+            endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+        if (!tasks[0].space.root) {
+            /* Recovery is a new request, never a replay of a child write. */
+            struct fs_message q = {.op = FS_LIST}, r;
+            struct task saved_desktop = tasks[1];
+            (void)process_file_request(&q, &r);
+            tasks[1] = saved_desktop;
+            tasks[0] = parked_server;
+            task_count = 2;
+            budget = 1000;
+            interactive = true;
+            for (unsigned i = 0; i < 2; ++i)
+                endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+        }
+        if (!tasks[0].space.root)
+            tasks[0].state = FAULTED;
+        console_write("DESKTOP CHILD FINISHED\n");
+    }
     ok = tasks[app].state == EXITED;
+    if (captured_output) {
+        captured_output->kind = tasks[app].state == EXITED    ? NOS_LAUNCH_EXITED
+                                : tasks[app].state == EXPIRED ? NOS_LAUNCH_TIMED_OUT
+                                                              : NOS_LAUNCH_FAULTED;
+        captured_output->exit_code = tasks[app].status;
+        captured_output->fault = (uint32_t)tasks[app].fault;
+    }
     if (ok) {
         console_write("EXIT CODE ");
         console_number(tasks[app].status);

@@ -1,5 +1,6 @@
 #include "../user/fs.h"
 #include "alloc.h"
+#include "display.h"
 #include "exceptions.h"
 #include "io.h"
 #include "limine.h"
@@ -8,7 +9,6 @@
 #include "process.h"
 #include "shell.h"
 #include "version.h"
-#include "display.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -541,6 +541,14 @@ __attribute__((noreturn)) void kmain(void) {
                 else if (!reply.status)
                     console_write("SDK AVAILABLE\n");
             }
+#if NEUROOS_DESKTOP
+            probe = (struct fs_message){.op = FS_STAT, .name = "hello.nos"};
+            if (process_file_request(&probe, &reply) && reply.status == -2)
+                (void)kernel_install_program("hello.nos");
+            probe = (struct fs_message){.op = FS_STAT, .name = "compiler.nos"};
+            if (process_file_request(&probe, &reply) && reply.status == -2)
+                (void)kernel_install_program("compiler.nos");
+#endif
         }
 #endif
     }

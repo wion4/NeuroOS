@@ -96,7 +96,8 @@ def build(test=False, fault=0):
         if app=='ramfs' and fs3:
             sources.remove('user/ramfs.c');sources+=['user/ramfs3.c','user/fs3.c']
         if installable:sources+=['user/file.c','user/heap.c','user/stdio.c']
-        if app=='desktop':sources+=['user/file.c','user/heap.c','user/format.c','user/string.c','user/stdio.c']
+        if app=='desktop':sources+=['user/file.c','user/heap.c','user/format.c','user/string.c','user/stdio.c',
+                                    'user/text.c','user/keyboard.c']
         if app=='filedemo':sources+=['tests/user_io.c']
         if app=='libcdemo':sources+=['user/format.c','user/string.c','user/setjmp.S','user/stdlib.c',
                                     'tests/user_libc.c','tests/user_jmp.S']

@@ -22,4 +22,5 @@ bool kernel_service_io_recovery_test(void);
 bool filesystem_store(const char *name, const void *data, unsigned bytes);
 void editor_run(const char *name);
 bool kernel_desktop(void);
+bool filesystem_execute(const char *name, const char *arguments, bool file_access);
 #endif

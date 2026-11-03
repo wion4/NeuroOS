@@ -2,11 +2,14 @@
 #include "desktop.h"
 #include "../kernel/version.h"
 #include "abi.h"
+#include "cyrillic.h"
 #include "file.h"
 #include "font.h"
 #include "heap.h"
+#include "keyboard.h"
 #include "libc/stdio.h"
 #include "libc/string.h"
+#include "text.h"
 #include <stdbool.h>
 #define W 800
 #define H 600
@@ -15,19 +18,17 @@
 #define INK 0xe5edf4u
 #define MUTED 0x93a6b8u
 #define EDGE 0x2c4052u
-enum { HOME, FILES, NOTES, CALC, APPEARANCE, APP_COUNT };
-static const char *titles[] = {"Welcome", "Files", "Notes", "Calculator", "Appearance"};
-static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style"};
+enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, APP_COUNT };
+static const char *titles[] = {"Welcome", "Files", "Notes", "Calculator", "Appearance", "Programs"};
+static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps"};
 struct window {
     int x, y, w, h;
     bool open;
 };
-static struct window windows[APP_COUNT] = {{132, 78, 620, 420, true},
-                                           {130, 78, 620, 430, false},
-                                           {150, 90, 600, 420, false},
-                                           {340, 85, 365, 425, false},
-                                           {220, 110, 490, 365, false}};
-static int order[APP_COUNT] = {0, 1, 2, 3, 4}, active;
+static struct window windows[APP_COUNT] = {{132, 78, 620, 420, true},   {130, 78, 620, 430, false},
+                                           {150, 90, 600, 420, false},  {340, 85, 365, 425, false},
+                                           {220, 110, 490, 365, false}, {140, 85, 620, 425, false}};
+static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5}, active;
 static uint32_t *pixels, accent = 0x51e1ae;
 static const uint32_t accents[] = {0x51e1ae, 0x6baeff, 0xc09aff, 0xffbf69};
 static unsigned theme;
@@ -43,14 +44,29 @@ struct file_item {
 static struct file_item files[FS_FILE_COUNT];
 static unsigned file_count, file_page;
 static int selected = -1;
-static char note[8193], filename[16] = "note.txt", loaded_name[16];
-static unsigned note_len, cursor, note_scroll, name_cursor = 8;
+static struct text_document document;
+#define note document.now.data
+#define note_len document.now.length
+#define cursor document.now.cursor
+static char filename[16] = "note.txt", loaded_name[16], saved_note[8193],
+            saved_filename[16] = "note.txt";
+static char clipboard[8193];
+static unsigned clipboard_bytes;
+static unsigned note_scroll, name_cursor = 8;
+static struct keyboard_layout layout;
+static bool selecting, note_maximized;
+static struct window note_restore;
 static bool dirty, name_focus;
 static char expression[32] = "0", result[40] = "0";
 static unsigned expr_len = 1;
 enum { NO_DIALOG, OPEN_FILE, NEW_NOTE, EXIT_DESKTOP, REPLACE_FILE };
 static int dialog;
 static char pending_name[16];
+static char program_name[16] = "hello.nos", program_arguments[80];
+static bool program_files, program_arguments_focus = true, program_has_result;
+static unsigned program_scroll;
+static struct desktop_launch_result program_result;
+static void paint(void);
 static void message(const char *s) {
     snprintf(notice, sizeof(notice), "%s", s);
     redraw = true;
@@ -77,14 +93,31 @@ static void rect(int x, int y, int w, int h, uint32_t c) {
 }
 static void line(int x, int y, int w, uint32_t c) { rect(x, y, w, 1, c); }
 static void text(int x, int y, const char *s, int scale, uint32_t c) {
-    while (*s) {
-        unsigned char ch = (unsigned char)*s++;
+    unsigned remaining = (unsigned)strlen(s);
+    while (remaining) {
+        uint32_t ch;
+        unsigned consumed = utf8_decode(s, remaining, &ch);
+        if (!consumed) {
+            consumed = 1;
+            ch = '?';
+        }
+        s += consumed;
+        remaining -= consumed;
         int index = ch >= '0' && ch <= '9'   ? ch - '0'
                     : ch >= 'A' && ch <= 'Z' ? ch - 'A' + 10
                     : ch >= 'a' && ch <= 'z' ? ch - 'a' + 36
                                              : -1;
         for (unsigned r = 0; r < 7; ++r) {
-            unsigned bits = index >= 0                        ? glyphs[index][r]
+            unsigned bits = ch >= 0x410 && ch <= 0x42f        ? cyrillic_upper[ch - 0x410][r]
+                            : ch >= 0x430 && ch <= 0x44f      ? cyrillic_lower[ch - 0x430][r]
+                            : ch == 0x401                     ? (r == 0   ? 10
+                                                                 : r == 1 ? 0
+                                                                          : glyphs['E' - 'A' + 10][r])
+                            : ch == 0x451                     ? (r == 0   ? 10
+                                                                 : r == 1 ? 0
+                                                                          : glyphs['e' - 'a' + 36][r])
+                            : ch > 127                        ? (r == 0 || r == 6 ? 31 : 17)
+                            : index >= 0                      ? glyphs[index][r]
                             : ch == '.' && r == 6             ? 4
                             : ch == ':' && (r == 2 || r == 5) ? 4
                             : ch == '-' && r == 3             ? 14
@@ -126,6 +159,10 @@ static void icon(int id, int x, int y, uint32_t color) {
         rect(x + 7, y + 5, 15, 6, PANEL);
         for (int i = 0; i < 6; ++i)
             rect(x + 8 + (i % 3) * 5, y + 15 + (i / 3) * 6, 3, 3, PANEL);
+    } else if (id == PROGRAMS) {
+        rect(x + 2, y + 4, 26, 23, color);
+        rect(x + 4, y + 7, 22, 17, PANEL);
+        text(x + 7, y + 10, ">_", 1, color);
     } else if (id == APPEARANCE) {
         for (int i = 0; i < 4; ++i)
             rect(x + 2 + (i % 2) * 14, y + 2 + (i / 2) * 14, 11, 11, accents[i]);
@@ -186,17 +223,13 @@ static void open_note(const char *name) {
     }
     long n = nos_file_read(name, 0, copy, (unsigned)bytes);
     bool valid = n == bytes;
-    for (long i = 0; valid && i < n; ++i)
-        if ((unsigned char)copy[i] > 126 ||
-            ((unsigned char)copy[i] < 32 && copy[i] != '\n' && copy[i] != '\t'))
-            valid = false;
+    valid = valid && text_valid(copy, (unsigned)bytes);
     if (valid) {
-        memcpy(note, copy, (size_t)n);
-        note[n] = 0;
-        note_len = (unsigned)n;
-        cursor = note_len;
+        (void)text_load(&document, copy, (unsigned)n);
+        memcpy(saved_note, note, note_len + 1);
         snprintf(filename, sizeof(filename), "%s", name);
         snprintf(loaded_name, sizeof(loaded_name), "%s", name);
+        memcpy(saved_filename, filename, strlen(filename) + 1);
         name_cursor = (unsigned)strlen(filename);
         note_scroll = 0;
         dirty = false;
@@ -205,7 +238,7 @@ static void open_note(const char *name) {
         message("Text file opened. Ctrl+S saves to disk.");
         say("DESKTOP NOTE OPENED\n");
     } else
-        message("This is not a supported plain-text file. File left unchanged.");
+        message("Not a valid UTF-8 text file. File left unchanged.");
     free(copy);
 }
 static void new_note(void) {
@@ -215,8 +248,10 @@ static void new_note(void) {
         if (nos_file_size(name) == -2) {
             memcpy(filename, name, strlen(name) + 1);
             loaded_name[0] = 0;
-            note_len = cursor = note_scroll = 0;
-            note[0] = 0;
+            (void)text_load(&document, "", 0);
+            note_scroll = 0;
+            saved_note[0] = 0;
+            memcpy(saved_filename, filename, strlen(filename) + 1);
             dirty = false;
             name_focus = false;
             name_cursor = (unsigned)strlen(filename);
@@ -262,6 +297,8 @@ static void save_note(bool overwrite) {
     }
     memcpy(loaded_name, filename, strlen(filename) + 1);
     dirty = false;
+    memcpy(saved_note, note, note_len + 1);
+    memcpy(saved_filename, filename, strlen(filename) + 1);
     refresh_files();
     message("Saved to disk. Your note will survive a restart.");
     say("DESKTOP NOTE SAVED\n");
@@ -383,100 +420,240 @@ static void calc_key(char key) {
     }
     redraw = true;
 }
+static unsigned note_columns(void) { return (unsigned)(windows[NOTES].w - 56) / 12; }
+static unsigned note_rows(void) { return (unsigned)(windows[NOTES].h - 165) / 17; }
 static void cursor_position(unsigned pos, unsigned *row, unsigned *column) {
-    unsigned r = 0, c = 0;
-    for (unsigned i = 0; i < pos; ++i) {
-        if (note[i] == '\n') {
-            ++r;
-            c = 0;
-        } else {
-            ++c;
-            if (c == 46) {
-                ++r;
-                c = 0;
-            }
-        }
-    }
-    *row = r;
-    *column = c;
-}
-static void vertical_cursor(bool down) {
-    unsigned row, col;
-    cursor_position(cursor, &row, &col);
-    if (!down && !row) {
-        cursor = 0;
-        return;
-    }
-    unsigned target = down ? row + 1 : row - 1;
-    for (unsigned i = 0; i <= note_len; ++i) {
-        unsigned r, c;
-        cursor_position(i, &r, &c);
-        if (r > target || (r == target && (c >= col || note[i] == '\n' || i == note_len))) {
-            cursor = i;
-            return;
-        }
-    }
-    cursor = note_len;
+    text_position(&document, pos, note_columns(), row, column);
 }
 static void note_key(unsigned key) {
     if (key == 19) {
         save_note(false);
         return;
     }
-    if (key == '\t') {
-        name_focus = !name_focus;
+    if (key == '\t' && name_focus) {
+        name_focus = false;
         redraw = true;
         return;
     }
+    if (key == 12) {
+        name_focus = true;
+        redraw = true;
+        return;
+    } /* Ctrl+L: filename. */
     if (name_focus) {
         unsigned n = (unsigned)strlen(filename);
         if (key == '\b' && name_cursor) {
             memmove(filename + name_cursor - 1, filename + name_cursor, n - name_cursor + 1);
             --name_cursor;
-            dirty = true;
-        } else if (key == 0x83 && name_cursor)
+        } else if (key == KEY_LEFT && name_cursor)
             --name_cursor;
-        else if (key == 0x84 && name_cursor < n)
+        else if (key == KEY_RIGHT && name_cursor < n)
             ++name_cursor;
+        else if (key == KEY_DELETE && name_cursor < n)
+            memmove(filename + name_cursor, filename + name_cursor + 1, n - name_cursor);
+        else if (key == KEY_HOME)
+            name_cursor = 0;
+        else if (key == KEY_END)
+            name_cursor = n;
         else if (key == '\n')
             name_focus = false;
         else if (key >= 32 && key <= 126 && n < 15) {
             memmove(filename + name_cursor + 1, filename + name_cursor, n - name_cursor + 1);
             filename[name_cursor++] = (char)key;
-            dirty = true;
         }
     } else {
-        if (key == '\b' && cursor) {
-            memmove(note + cursor - 1, note + cursor, note_len - cursor + 1);
-            --cursor;
-            --note_len;
-            dirty = true;
-        } else if (key == 0x83 && cursor)
-            --cursor;
-        else if (key == 0x84 && cursor < note_len)
-            ++cursor;
-        else if (key == 0x81)
-            vertical_cursor(false);
-        else if (key == 0x82)
-            vertical_cursor(true);
-        else if ((key >= 32 && key <= 126) || key == '\n') {
-            if (note_len < 8192) {
-                memmove(note + cursor + 1, note + cursor, note_len - cursor + 1);
-                note[cursor++] = (char)key;
-                ++note_len;
-                dirty = true;
-            } else
-                message("Note is full (8 KiB). Save this file and start another note.");
-        }
+        bool success = true;
+        if (key == 1) {
+            document.now.anchor = 0;
+            cursor = note_len;
+        } else if (key == 3 || key == 24) {
+            unsigned first, count = text_selection(&document, &first);
+            if (count) {
+                memcpy(clipboard, note + first, count);
+                clipboard_bytes = count;
+                clipboard[count] = 0;
+                if (key == 24)
+                    success = text_insert(&document, "", 0);
+            }
+        } else if (key == 22) {
+            if (clipboard_bytes)
+                success = text_insert(&document, clipboard, clipboard_bytes);
+        } else if (key == 26 || key == 25)
+            (void)text_undo(&document, key == 25 || (input.modifiers & INPUT_SHIFT));
+        else if (key == '\b')
+            success = text_erase(&document, true);
+        else if (key == KEY_DELETE)
+            success = text_erase(&document, false);
+        else if (key >= KEY_UP && key <= KEY_PAGEDOWN)
+            text_move(&document, key, (input.modifiers & INPUT_SHIFT) != 0,
+                      (input.modifiers & INPUT_CONTROL) != 0, note_columns());
+        else if (key == '\t')
+            success = text_insert(&document, "    ", 4);
+        else if ((key >= 32 && key <= 0x10ffff) || key == '\n')
+            success = text_codepoint(&document, key);
+        if (!success)
+            message("Text limit reached (8 KiB). The current document is preserved.");
+    }
+    dirty = strcmp(note, saved_note) || strcmp(filename, saved_filename);
+    redraw = true;
+}
+static bool program_suffix(const char *name) {
+    size_t n = strlen(name);
+    return n >= 5 && !strcmp(name + n - 4, ".nos");
+}
+static void open_file(const char *name) {
+    if (program_suffix(name)) {
+        snprintf(program_name, sizeof(program_name), "%s", name);
+        program_arguments[0] = 0;
+        program_files = false;
+        program_arguments_focus = true;
+        program_has_result = false;
+        program_scroll = 0;
+        front(PROGRAMS);
+        message("Native program selected. File access is off by default.");
+    } else
+        request_open(name);
+}
+static void build_source(const char *name) {
+    size_t n = strlen(name);
+    if (n < 3 || strcmp(name + n - 2, ".c") || n > 13) {
+        message("Choose a C source ending in .c (name up to 13 characters).");
+        return;
+    }
+    char output[16];
+    memcpy(output, name, n - 2);
+    memcpy(output + n - 2, ".nos", 5);
+    snprintf(program_name, sizeof(program_name), "compiler.nos");
+    snprintf(program_arguments, sizeof(program_arguments), "%s %s", name, output);
+    program_files = false;
+    program_arguments_focus = true;
+    program_has_result = false;
+    front(PROGRAMS);
+    message(
+        "Compiler needs file access: enable it, then Run. Existing files are preserved on error.");
+}
+static void run_program(void) {
+    if (!program_suffix(program_name)) {
+        message("Choose an executable with the .nos extension.");
+        return;
+    }
+    struct desktop_launch_request q = {.flags = program_files ? NOS_LAUNCH_FILES : 0};
+    snprintf(q.name, sizeof(q.name), "%s", program_name);
+    snprintf(q.arguments, sizeof(q.arguments), "%s", program_arguments);
+    program_has_result = false;
+    message("Running native program. The desktop resumes when it finishes.");
+    paint();
+    long e = call3(13, (uintptr_t)&q, (uintptr_t)&program_result, sizeof(q));
+    if (e < 0) {
+        message("Program could not start. File service unavailable or request rejected.");
+        return;
+    }
+    program_has_result = true;
+    program_scroll = 0;
+    if (program_result.kind == NOS_LAUNCH_LOAD_ERROR)
+        message("Could not load this file as a NeuroOS executable.");
+    else if (program_result.kind == NOS_LAUNCH_FAULTED)
+        message("Program fault contained. Your desktop and notes are still here.");
+    else if (program_result.kind == NOS_LAUNCH_TIMED_OUT)
+        message("Program reached its CPU time limit. Desktop restored.");
+    else
+        message("Program finished. Your desktop and unsaved notes were preserved.");
+    refresh_files();
+    say("DESKTOP PROGRAM RESULT\n");
+}
+static void program_key(uint32_t key) {
+    if (key == '\t') {
+        program_arguments_focus = !program_arguments_focus;
+        redraw = true;
+        return;
+    }
+    if (key == '\n') {
+        run_program();
+        return;
+    }
+    char *field = program_arguments_focus ? program_arguments : program_name;
+    unsigned length = (unsigned)strlen(field), limit = program_arguments_focus ? 79 : 15;
+    if (!program_arguments_focus &&
+        ((key == '\b' && length) || (key >= 32 && key <= 126 && length < limit)))
+        program_files = false;
+    if (key == '\b' && length)
+        field[length - 1] = 0;
+    else if (key >= 32 && key <= 126 && length < limit) {
+        field[length] = (char)key;
+        field[length + 1] = 0;
     }
     redraw = true;
 }
+static unsigned output_rows(void) {
+    unsigned rows = 1, col = 0;
+    for (unsigned i = 0; i < program_result.bytes; ++i) {
+        if (program_result.output[i] == '\n') {
+            ++rows;
+            col = 0;
+        } else if (++col == 92) {
+            ++rows;
+            col = 0;
+        }
+    }
+    return rows;
+}
+static void draw_programs(struct window *w) {
+    int x = w->x + 20, y = w->y + 50;
+    text(x, y + 9, "FILE", 1, MUTED);
+    rect(x + 38, y, 185, 28, program_arguments_focus ? BG : EDGE);
+    text(x + 47, y + 10, program_name, 1, INK);
+    button(x + 237, y, 80, "Run", true);
+    button(x + 330, y, 245, program_files ? "[x] Allow file access" : "[ ] Allow file access",
+           false);
+    text(x, y + 49, "ARGS", 1, MUTED);
+    rect(x + 38, y + 39, w->w - 78, 28, program_arguments_focus ? EDGE : BG);
+    unsigned args_length = (unsigned)strlen(program_arguments);
+    text(x + 47, y + 49, program_arguments + (args_length > 75 ? args_length - 75 : 0), 1, INK);
+    if (program_arguments_focus)
+        rect(x + 47 + (int)(args_length > 75 ? 75 : args_length) * 6, y + 46, 1, 14, accent);
+    rect(x, y + 81, w->w - 40, 235, BG);
+    if (program_has_result) {
+        unsigned row = 0, col = 0;
+        for (unsigned i = 0; i < program_result.bytes; ++i) {
+            char ch = program_result.output[i];
+            if (ch == '\n') {
+                ++row;
+                col = 0;
+                continue;
+            }
+            if (row >= program_scroll && row < program_scroll + 18) {
+                char value[2] = {ch, 0};
+                text(x + 8 + (int)col * 6, y + 91 + (int)(row - program_scroll) * 12, value, 1,
+                     INK);
+            }
+            if (++col == 92) {
+                ++row;
+                col = 0;
+            }
+        }
+        char status[70];
+        if (program_result.kind == NOS_LAUNCH_EXITED)
+            snprintf(status, sizeof(status), "Exit code %llu%s",
+                     (unsigned long long)program_result.exit_code,
+                     program_result.truncated ? " / output truncated" : "");
+        else if (program_result.kind == NOS_LAUNCH_FAULTED)
+            snprintf(status, sizeof(status), "Contained fault %u", program_result.fault);
+        else if (program_result.kind == NOS_LAUNCH_TIMED_OUT)
+            snprintf(status, sizeof(status), "CPU time limit reached");
+        else
+            snprintf(status, sizeof(status), "Load error");
+        text(x, y + 338, status, 1, accent);
+    } else
+        text(x + 12, y + 101, "Choose a .nos file in Files, then Run.", 1, MUTED);
+    button(x + 400, y + 326, 76, "Up", false);
+    button(x + 486, y + 326, 76, "Down", false);
+}
 static void draw_home(struct window *w) {
     int x = w->x + 26, y = w->y + 68;
-    text(x, y, "A small beginning.", 3, INK);
-    text(x, y + 32, "A real operating system.", 2, accent);
-    text(x, y + 75, "Your files, your notes, your desktop.", 1, MUTED);
-    text(x, y + 94, "Running directly on the NeuroOS kernel.", 1, MUTED);
+    text(x, y, "Your space.", 3, INK);
+    text(x, y + 32, "Write. Build. Explore.", 2, accent);
+    text(x, y + 75, "Notes in Russian or English. Your files on disk.", 1, MUTED);
+    text(x, y + 94, "Run native programs without leaving your desktop.", 1, MUTED);
     for (int i = 1; i <= 3; ++i) {
         int cx = x + (i - 1) * 185;
         rect(cx, y + 135, 172, 112, 0x203244);
@@ -488,14 +665,15 @@ static void draw_home(struct window *w) {
                       : "Do a quick sum",
              1, MUTED);
     }
-    text(x, y + 280, "PREVIEW " NEUROOS_VERSION "  /  Native x86-64  /  No AI yet", 1, MUTED);
-    text(x, y + 304, "Drag a title bar. Use the dock to switch tools.", 1, MUTED);
+    text(x, y + 280, "PREVIEW " NEUROOS_VERSION "  /  RU-EN in the top bar", 1, MUTED);
+    text(x, y + 304, "Ctrl+S saves. Apps opens native .nos programs.", 1, MUTED);
 }
 static void draw_files(struct window *w) {
     int x = w->x + 20, y = w->y + 50;
     button(x, y, 100, "New note", true);
     button(x + 112, y, 90, "Refresh", false);
-    button(x + 214, y, 110, "Open text", false);
+    button(x + 214, y, 110, "Open / Run", false);
+    button(x + 338, y, 96, "Build C", false);
     text(x, y + 48, "NAME", 1, MUTED);
     text(x + 410, y + 48, "BYTES", 1, MUTED);
     line(x, y + 64, w->w - 40, EDGE);
@@ -529,36 +707,57 @@ static void draw_notes(struct window *w) {
     button(x + 378, y, 74, "New", false);
     text(x + 466, y + 10, dirty ? "Unsaved" : "Saved", 1, dirty ? 0xffbf69 : MUTED);
     int bx = x, by = y + 44;
-    rect(bx, by, w->w - 40, 264, 0x0c1722);
+    rect(bx, by, w->w - 40, w->h - 156, 0x0c1722);
     unsigned cr, cc;
     cursor_position(cursor, &cr, &cc);
     if (cr < note_scroll)
         note_scroll = cr;
-    if (cr >= note_scroll + 15)
-        note_scroll = cr - 14;
-    unsigned row = 0, col = 0;
-    for (unsigned i = 0; i < note_len; ++i) {
-        char c = note[i];
-        if (c == '\n') {
-            ++row;
-            col = 0;
+    if (cr >= note_scroll + note_rows())
+        note_scroll = cr - note_rows() + 1;
+    unsigned row = 0, col = 0, first, count = text_selection(&document, &first);
+    for (unsigned i = 0; i < note_len;) {
+        uint32_t cp;
+        unsigned n = utf8_decode(note + i, note_len - i, &cp);
+        if (!n)
+            break;
+        if (cp == '\r') {
+            i += n;
             continue;
         }
-        if (row >= note_scroll && row < note_scroll + 15) {
-            char s[2] = {c == '\t' ? ' ' : c, 0};
-            text(bx + 8 + (int)col * 12, by + 9 + (int)(row - note_scroll) * 17, s, 2, INK);
-        }
-        if (++col == 46) {
+        if (cp == '\n') {
+            if (i >= first && i < first + count && row >= note_scroll &&
+                row < note_scroll + note_rows())
+                rect(bx + 8 + (int)col * 12, by + 8 + (int)(row - note_scroll) * 17, 12, 17, EDGE);
             ++row;
             col = 0;
+            i += n;
+            continue;
         }
+        unsigned cells = cp == '\t' ? 4 - col % 4 : 1;
+        for (unsigned cell = 0; cell < cells; ++cell) {
+            if (row >= note_scroll && row < note_scroll + note_rows()) {
+                int px = bx + 8 + (int)col * 12, py = by + 9 + (int)(row - note_scroll) * 17;
+                if (i >= first && i < first + count)
+                    rect(px, py - 1, 12, 17, 0x365b79);
+                if (cp != '\t') {
+                    char bytes[5] = {0};
+                    utf8_encode(cp, bytes);
+                    text(px, py, bytes, 2, INK);
+                }
+            }
+            if (++col == note_columns()) {
+                ++row;
+                col = 0;
+            }
+        }
+        i += n;
     }
     if (!name_focus)
         rect(bx + 8 + (int)cc * 12, by + 9 + (int)(cr - note_scroll) * 17, 2, 14, accent);
     char status[70];
-    snprintf(status, sizeof(status), "%u / 8192 bytes    Ctrl+S save    Tab: name / text",
+    snprintf(status, sizeof(status), "%u / 8192 bytes  UTF-8  Ctrl+S save / Z undo / L name",
              note_len);
-    text(x, y + 328, status, 1, MUTED);
+    text(x, y + w->h - 92, status, 1, MUTED);
 }
 static const char *calc_keys[] = {"7", "8", "9", "/", "4", "5", "6", "*",
                                   "1", "2", "3", "-", "C", "0", "=", "+"};
@@ -586,7 +785,7 @@ static void draw_appearance(struct window *w) {
             text(x + i * 100 + 24, y + 98, "OK", 2, BG);
     }
     text(x, y + 168, "The choice is saved on your disk.", 1, MUTED);
-    text(x, y + 191, "Desktop preview / US keyboard / ASCII text", 1, MUTED);
+    text(x, y + 191, "UTF-8 notes / RU-EN: Alt+Shift or top bar", 1, MUTED);
     text(x, y + 216, "Tools currently share one desktop process.", 1, MUTED);
     text(x, y + 239, "Files run in a separate isolated service.", 1, MUTED);
 }
@@ -626,6 +825,8 @@ static void paint(void) {
         if (id == active)
             rect(w->x, w->y, 3, 35, accent);
         text(w->x + 15, w->y + 14, titles[id], 1, INK);
+        if (id == NOTES)
+            button(w->x + w->w - 76, w->y + 4, 30, note_maximized ? "-" : "+", false);
         button(w->x + w->w - 38, w->y + 4, 30, "x", false);
         if (id == HOME)
             draw_home(w);
@@ -637,6 +838,8 @@ static void paint(void) {
             draw_calc(w);
         if (id == APPEARANCE)
             draw_appearance(w);
+        if (id == PROGRAMS)
+            draw_programs(w);
     }
     rect(0, 533, W, 67, 0x111e2b);
     line(0, 533, W, EDGE);
@@ -647,6 +850,7 @@ static void paint(void) {
         icon(id, x + 8, 547, accent);
         text(x + 43, 558, labels[id], 1, INK);
     }
+    button(525, 3, 70, layout.russian ? "RU" : "EN", false);
     button(685, 550, 96, "Console", false);
     text(16, 516, notice, 1, MUTED);
     if (dialog) {
@@ -670,6 +874,11 @@ static void paint(void) {
     redraw = false;
 }
 static void click(void) {
+    if (!dialog && inside(525, 3, 70, 28)) {
+        layout.russian = !layout.russian;
+        redraw = true;
+        return;
+    }
     if (dialog) {
         if (inside(280, 292, 120, 28))
             dialog = NO_DIALOG;
@@ -700,7 +909,21 @@ static void click(void) {
             w->open = false;
             return;
         }
+        if (id == NOTES && inside(w->x + w->w - 76, w->y + 4, 30, 28)) {
+            if (note_maximized) {
+                *w = note_restore;
+                note_maximized = false;
+            } else {
+                note_restore = *w;
+                *w = (struct window){0, 35, 800, 480, true};
+                note_maximized = true;
+            }
+            redraw = true;
+            return;
+        }
         if (input.y < w->y + 35) {
+            if (id == NOTES && note_maximized)
+                return;
             drag = id;
             drag_x = input.x - w->x;
             drag_y = input.y - w->y;
@@ -721,7 +944,9 @@ static void click(void) {
             else if (inside(x + 112, y, 90, 28))
                 refresh_files();
             else if (inside(x + 214, y, 110, 28) && selected >= 0)
-                request_open(files[selected].name);
+                open_file(files[selected].name);
+            else if (inside(x + 338, y, 96, 28) && selected >= 0)
+                build_source(files[selected].name);
             else if (inside(x + 400, y + 316, 76, 28)) {
                 file_page = file_page >= 9 ? file_page - 9 : 0;
                 selected = -1;
@@ -743,20 +968,32 @@ static void click(void) {
                 save_note(false);
             else if (inside(x + 378, y, 74, 28))
                 request_new();
-            else if (inside(x, y + 44, w->w - 40, 264)) {
+            else if (inside(x, y + 44, w->w - 40, w->h - 156)) {
                 name_focus = false;
                 unsigned targetrow =
                     note_scroll + (unsigned)(input.y < y + 53 ? 0 : input.y - (y + 53)) / 17;
                 unsigned targetcol = (unsigned)(input.x - x < 8 ? 0 : input.x - x - 8) / 12;
-                cursor = note_len;
-                for (unsigned j = 0; j <= note_len; ++j) {
-                    unsigned r, c;
-                    cursor_position(j, &r, &c);
-                    if (r > targetrow || (r == targetrow && (c >= targetcol || note[j] == '\n'))) {
-                        cursor = j;
-                        break;
-                    }
-                }
+                cursor = text_hit(&document, targetrow, targetcol, note_columns());
+                if (!(input.modifiers & INPUT_SHIFT))
+                    document.now.anchor = cursor;
+                selecting = true;
+            }
+        } else if (id == PROGRAMS) {
+            if (inside(x + 38, y, 185, 28))
+                program_arguments_focus = false;
+            else if (inside(x + 38, y + 39, w->w - 78, 28))
+                program_arguments_focus = true;
+            else if (inside(x + 237, y, 80, 28))
+                run_program();
+            else if (inside(x + 330, y, 245, 28))
+                program_files = !program_files;
+            else if (inside(x + 400, y + 326, 76, 28))
+                program_scroll = program_scroll > 15 ? program_scroll - 15 : 0;
+            else if (inside(x + 486, y + 326, 76, 28)) {
+                unsigned rows = output_rows(), limit = rows > 18 ? rows - 18 : 0;
+                program_scroll += 15;
+                if (program_scroll > limit)
+                    program_scroll = limit;
             }
         } else if (id == CALC) {
             for (int j = 0; j < 16; ++j)
@@ -806,9 +1043,9 @@ int user_main(void) {
     } else
         settings_conflict = config_size != -2;
     /* New unsaved editor buffer; never overwrite a user's existing note at boot. */
-    strcpy(note, "Hello from NeuroOS!\n\nThis is a real note. Edit me, then click Save.\n");
-    note_len = (unsigned)strlen(note);
-    cursor = note_len;
+    const char *greeting =
+        "Hello from NeuroOS!\n\nThis is a real note. Edit me, then click Save.\n";
+    (void)text_load(&document, greeting, (unsigned)strlen(greeting));
     dirty = true;
     say("DESKTOP READY\n");
     struct desktop_input old = {.x = -1, .y = -1};
@@ -821,8 +1058,20 @@ int user_main(void) {
             redraw = true;
         if ((input.buttons & 1) && !(old.buttons & 1))
             click();
-        if (!(input.buttons & 1))
+        if (!(input.buttons & 1)) {
             drag = -1;
+            selecting = false;
+        }
+        if (selecting && (input.buttons & 1) && active == NOTES) {
+            struct window *w = &windows[NOTES];
+            int x = w->x + 28, y = w->y + 101;
+            unsigned row = note_scroll + (unsigned)(input.y < y ? 0 : input.y - y) / 17;
+            unsigned col = (unsigned)(input.x < x ? 0 : input.x - x) / 12;
+            if (col >= note_columns())
+                col = note_columns() - 1;
+            cursor = text_hit(&document, row, col, note_columns());
+            redraw = true;
+        }
         if (drag >= 0) {
             struct window *w = &windows[drag];
             w->x = input.x - drag_x;
@@ -837,15 +1086,21 @@ int user_main(void) {
                 w->y = 515 - w->h;
             redraw = true;
         }
-        if (input.key) {
+        bool was_ru = layout.russian;
+        uint32_t key = keyboard_translate(&layout, &input);
+        if (was_ru != layout.russian)
+            redraw = true;
+        if (key) {
             if (dialog) {
-                if (input.key == 27)
+                if (key == 27)
                     dialog = NO_DIALOG;
                 redraw = true;
             } else if (windows[active].open && active == NOTES)
-                note_key(input.key);
+                note_key(key);
+            else if (windows[active].open && active == PROGRAMS)
+                program_key(key);
             else if (windows[active].open && active == CALC)
-                calc_key((char)input.key);
+                calc_key(key < 128 ? (char)key : 0);
         }
         if (redraw)
             paint();
