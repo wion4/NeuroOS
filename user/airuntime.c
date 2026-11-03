@@ -37,7 +37,7 @@ int user_main(void) {
     say("AI RUNTIME READY - READ ONLY MODEL, NO FILE OR DISK RIGHTS\n");
     for (;;) {
         struct ai_request q;
-        long n = receive_message(1, &q, sizeof(q));
+        long n = receive_wait(1, &q, sizeof(q));
         if (n == -11) {
             yield();
             continue;

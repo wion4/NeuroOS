@@ -48,7 +48,7 @@ int user_main(void) {
         say("RAMFS SERVICE READY\n");
     for (;;) {
         struct fs_message q, r;
-        long n = receive_message(1, &q, sizeof(q));
+        long n = receive_wait(1, &q, sizeof(q));
         if (n == -11) {
             yield();
             continue;

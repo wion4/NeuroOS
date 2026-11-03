@@ -150,7 +150,8 @@ def build(test=False, fault=0):
         'user/strtod.c','user/float_math.c','vendor/musl-1.2.5/floatscan.c',str(compiler_source/'libtcc.c')]
     for source in compiler_sources:
         obj=target/('compiler-'+Path(source).stem+'.o')
-        extra=['-Os','-ffunction-sections','-fdata-sections','-I'+str(compiler_source),'-I'+str(target)]
+        extra=['-Os','-ffunction-sections','-fdata-sections','-I'+str(compiler_source),'-I'+str(target),
+               f'-ffile-prefix-map={compiler_source.as_posix()}=vendor/tinycc']
         if source=='user/strtod.c' or source.startswith('vendor/musl-'):
             extra+=['-Iports/musl/include','-Iuser/libc','-Dhidden=']
         if source.startswith('vendor/musl-'):extra+=['-Wno-parentheses','-Wno-sign-compare']

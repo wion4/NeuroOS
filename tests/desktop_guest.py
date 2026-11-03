@@ -5,20 +5,20 @@ import socket
 import subprocess
 import time
 class DesktopGuest:
-    def __init__(self,neuro,target,folder):
+    def __init__(self,neuro,target,folder,boot_timeout=35):
         self.target=target;self.folder=folder;self.log=target/'serial.log';self.log.write_bytes(b'')
         with socket.socket() as probe:probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
         cmd=neuro.qemu_command(target,False,128)+['-qmp',f'tcp:127.0.0.1:{port},server=on,wait=off']
         self.error=(folder/'qemu.log').open('ab');self.proc=subprocess.Popen(cmd,cwd=target,stdout=self.error,stderr=self.error)
         try:
-            until=time.monotonic()+35
+            until=time.monotonic()+boot_timeout
             while True:
                 try:self.conn=socket.create_connection(('127.0.0.1',port),timeout=3);break
                 except OSError:
                     if time.monotonic()>until:raise RuntimeError('QMP unavailable')
                     time.sleep(.1)
             self.stream=self.conn.makefile('rwb',buffering=0);json.loads(self.stream.readline())
-            self.qmp('qmp_capabilities');self.wait(b'DESKTOP READY');time.sleep(.5)
+            self.qmp('qmp_capabilities');self.wait(b'DESKTOP READY',timeout=boot_timeout);time.sleep(.5)
             self.x,self.y=400,300
         except BaseException:self.close();raise
     def qmp(self,name,args=None):

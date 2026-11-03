@@ -313,6 +313,7 @@ bool kernel_desktop(void) {
     graphics_active = true;
     console_write(mouse_init() ? "MOUSE READY\n" : "MOUSE UNAVAILABLE\n");
     bool ok = process_run_desktop(program, bytes);
+    console_write(ok ? "DESKTOP EXIT CLEAN\n" : "DESKTOP SESSION FAILED\n");
     graphics_active = false;
     console_clear();
     return ok;

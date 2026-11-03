@@ -6,6 +6,9 @@ int user_main(struct ai_session *session) {
         return 1;
     if (call3(17, 3, ~0ull, 0) != -1)
         return 2;
+    if (receive_wait(3, session, 64) != -1 || receive_wait(2, (void *)0x400000, 64) != -14 ||
+        receive_wait(2, session, 65) != -22)
+        return 9;
     long n;
     while ((n = send_message(1, &session->request, sizeof(session->request))) == -11)
         yield();
@@ -15,7 +18,7 @@ int user_main(struct ai_session *session) {
     session->status = -5;
     for (;;) {
         struct ai_reply r;
-        while ((n = receive_message(2, &r, sizeof(r))) == -11)
+        while ((n = receive_wait(2, &r, sizeof(r))) == -11)
             yield();
         if (n != sizeof(r))
             return 4;

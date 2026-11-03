@@ -16,7 +16,7 @@ _Static_assert(sizeof(struct cpu_context) == 176, "ASM full frame");
 #define TASKS 9
 #define SEND 1u
 #define RECEIVE 2u
-enum state { READY, EXITED, FAULTED, EXPIRED, SUSPENDED };
+enum state { READY, EXITED, FAULTED, EXPIRED, SUSPENDED, SLEEPING, WAITING };
 struct capability {
     unsigned endpoint, rights;
 };
@@ -29,6 +29,7 @@ struct task {
     unsigned ticks;
     bool ipc_idle, desktop;
     uint64_t fault, error, address, status;
+    uint64_t wake_tick;
 };
 static struct task tasks[TASKS];
 static uint8_t stacks[TASKS][16384] __attribute__((aligned(16)));
@@ -53,6 +54,10 @@ static const void *ai_server_code, *ai_client_code, *ai_model;
 static uint64_t ai_server_bytes, ai_client_bytes, ai_model_bytes;
 static unsigned ai_restarts;
 static bool ai_started;
+static bool ai_job_active;
+static struct ai_request ai_job_request;
+static long desktop_ai_job(struct task *desktop, uint64_t op, uint64_t address, uint64_t bytes);
+static void discard_ai_job(void);
 void process_filesystem_inject_fault(void) {
     if (parked_server.space.root)
         parked_server.context.rip = 0;
@@ -70,15 +75,26 @@ struct endpoint {
     struct message queue[8];
     unsigned head, count, owner, producer;
 };
-static struct endpoint endpoints[2];
+/* Foreground FS uses 0/1. Background inference has a separate 2/3 pair. */
+static struct endpoint endpoints[4];
 extern char user_program_start[], user_program_end[];
 extern void process_enter(struct cpu_context *, uint64_t *);
 extern __attribute__((noreturn)) void process_leave(uint64_t);
 extern void timer_irq(void);
 
 static bool permits(const struct task *task, uint64_t handle, unsigned rights) {
-    return handle < 4 && task->caps[handle].endpoint < 2 &&
+    return handle < 4 && task->caps[handle].endpoint < 4 &&
            (task->caps[handle].rights & rights) == rights;
+}
+static bool task_alive(const struct task *task) {
+    return task->state == READY || task->state == SLEEPING || task->state == SUSPENDED ||
+           task->state == WAITING;
+}
+static void resume_wait(struct task *task) {
+    if (task->state == WAITING) {
+        task->state = READY;
+        task->context.rax = (uint64_t)-11; /* A parked receive is retried by the service. */
+    }
 }
 static void syscall(struct task *task) {
     struct cpu_context *f = &task->context;
@@ -153,7 +169,8 @@ static void syscall(struct task *task) {
         break;
     }
     case 7:
-    case 8: {
+    case 8:
+    case 16: {
         bool send = call == 7;
         if (!permits(task, f->rdi, send ? SEND : RECEIVE)) {
             ++denied;
@@ -165,8 +182,13 @@ static void syscall(struct task *task) {
             f->rax = (uint64_t)-22;
             break;
         }
+        if (call == 16 && !user_check_write(&task->space, f->rsi, (size_t)f->rdx)) {
+            ++bad_pointers;
+            f->rax = (uint64_t)-14;
+            break;
+        }
         if (send) {
-            if (tasks[ep->owner].state != READY) {
+            if (!task_alive(&tasks[ep->owner])) {
                 f->rax = (uint64_t)-32;
                 break;
             }
@@ -189,7 +211,9 @@ static void syscall(struct task *task) {
                 task->ipc_idle = true; /* The trusted server has finished this request. */
         } else {
             if (!ep->count) {
-                f->rax = (uint64_t)(tasks[ep->producer].state == READY ? -11 : -32);
+                f->rax = (uint64_t)(task_alive(&tasks[ep->producer]) ? -11 : -32);
+                if (call == 16 && (long)f->rax == -11)
+                    task->state = WAITING;
                 break;
             }
             struct message *m = &ep->queue[ep->head];
@@ -269,8 +293,7 @@ static void syscall(struct task *task) {
             f->rax = (uint64_t)-1;
             break;
         }
-        /* Trusted foreground desktop sleeps with interrupts on. The filesystem
-           has no pending work here: all UI file calls finish synchronously. */
+        /* Sleep this task, rather than the kernel, so other user tasks run. */
         if (f->rdi > 10) {
             f->rax = (uint64_t)-22;
             break;
@@ -278,14 +301,17 @@ static void syscall(struct task *task) {
         task->ticks = 0;
         if (tasks[0].ipc_idle)
             tasks[0].ticks = 0;
-        uint64_t end = timer_ticks() + f->rdi;
-        while (timer_ticks() < end)
-            __asm__ volatile("sti; hlt; cli" ::: "memory");
+        task->wake_tick = timer_ticks() + f->rdi;
+        task->state = SLEEPING;
         break;
     }
     case 13: {
         if (!task->desktop) {
             f->rax = (uint64_t)-1;
+            break;
+        }
+        if (ai_job_active) {
+            f->rax = (uint64_t)-16;
             break;
         }
         if (f->rdx != sizeof(launch_request) ||
@@ -303,8 +329,8 @@ static void syscall(struct task *task) {
             f->rax = (uint64_t)-22;
             break;
         }
-        if (current != 1 || tasks[0].state != READY || !tasks[0].ipc_idle || endpoints[0].count ||
-            endpoints[1].count) {
+        if (current != 1 || (tasks[0].state != READY && tasks[0].state != WAITING) ||
+            !tasks[0].ipc_idle || endpoints[0].count || endpoints[1].count) {
             f->rax = (uint64_t)-16;
             break;
         }
@@ -322,6 +348,10 @@ static void syscall(struct task *task) {
     case 14: {
         if (!task->desktop) {
             f->rax = (uint64_t)-1;
+            break;
+        }
+        if (ai_job_active) {
+            f->rax = (uint64_t)-16;
             break;
         }
         struct ai_request request;
@@ -351,6 +381,9 @@ static void syscall(struct task *task) {
         task->state = SUSPENDED;
         break;
     }
+    case 15:
+        f->rax = (uint64_t)desktop_ai_job(task, f->rdi, f->rsi, f->rdx);
+        break;
     case 17: {
         if (f->rdi != 3 || task->caps[3].endpoint != 3 || task->caps[3].rights != 16 || !ai_model) {
             f->rax = (uint64_t)-1;
@@ -379,22 +412,48 @@ static void syscall(struct task *task) {
     }
 }
 static struct cpu_context *choose_next(void) {
-    if (interactive && tasks[1].state != READY) {
+    /* A completed background client must not leave its server spinning while
+       the desktop polls the result. Keep the server's resumable READY state. */
+    bool job_done = ai_job_active && !task_alive(&tasks[3]);
+    if (interactive && tasks[1].state != READY && tasks[1].state != SLEEPING &&
+        tasks[1].state != WAITING) {
         running = false;
         paging_switch(paging_kernel_root());
         process_leave(saved_kernel_rsp);
     }
-    for (unsigned i = 1; i <= task_count; ++i) {
-        unsigned next = (current + i) % task_count;
-        if (tasks[next].state != READY)
-            continue;
-        if (next != current)
-            ++switches;
-        current = next;
-        exceptions_kernel_stack((uint64_t)&stacks[next][sizeof(stacks[next])]);
-        paging_switch(tasks[next].space.root);
-        fpu_restore(&tasks[next].fp);
-        return &tasks[next].context;
+    for (;;) {
+        bool sleeping = false;
+        for (unsigned i = 0; i < task_count; ++i) {
+            if (tasks[i].state == WAITING && !(job_done && i == 2)) {
+                struct endpoint *ep = &endpoints[tasks[i].caps[tasks[i].context.rdi].endpoint];
+                if (ep->count || !task_alive(&tasks[ep->producer])) {
+                    tasks[i].state = READY;
+                    tasks[i].context.rax = 16;
+                    syscall(&tasks[i]);
+                }
+            }
+            if (tasks[i].state == SLEEPING) {
+                if (timer_ticks() >= tasks[i].wake_tick)
+                    tasks[i].state = READY;
+                else
+                    sleeping = true;
+            }
+        }
+        for (unsigned i = 1; i <= task_count; ++i) {
+            unsigned next = (current + i) % task_count;
+            if (tasks[next].state != READY || (job_done && next == 2))
+                continue;
+            if (next != current)
+                ++switches;
+            current = next;
+            exceptions_kernel_stack((uint64_t)&stacks[next][sizeof(stacks[next])]);
+            paging_switch(tasks[next].space.root);
+            fpu_restore(&tasks[next].fp);
+            return &tasks[next].context;
+        }
+        if (!sleeping)
+            break;
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
     }
     running = false;
     paging_switch(paging_kernel_root());
@@ -615,6 +674,7 @@ bool process_filesystem_restart(void) {
 }
 static void park_filesystem(void) {
     parked_server = tasks[0];
+    resume_wait(&parked_server);
     if (parked_server.state == READY && parked_server.ipc_idle && !endpoints[0].count &&
         !endpoints[1].count)
         return;
@@ -679,6 +739,7 @@ bool process_file_request(const void *request, void *response) {
     paging_switch(tasks[0].space.root);
     process_enter(&tasks[0].context, &saved_kernel_rsp);
     fpu_end();
+    resume_wait(&tasks[0]);
     ok = tasks[1].state == EXITED && !tasks[1].status && tasks[0].state == READY &&
          tasks[0].ipc_idle && !endpoints[0].count && !endpoints[1].count &&
          user_copy_from(&tasks[1].space, response, boot, 64);
@@ -699,6 +760,7 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
     if (running || (file_access && !parked_server.space.root))
         goto done;
     uint64_t before = pmm_available(), entry;
+    uint64_t ai_pages_before = parked_ai.space.count + parked_ai.space.heap_pages;
     unsigned app = file_access ? 1 : 0;
     task_count = app + 1;
     budget = 1000;
@@ -797,6 +859,11 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         console_write("DESKTOP CHILD FINISHED\n");
     }
     ok = tasks[app].state == EXITED;
+    if (tasks[app].desktop && ai_job_active) {
+        discard_ai_job();
+        ai_started = false;
+        ai_restarts = 0;
+    }
     if (captured_output) {
         captured_output->kind = tasks[app].state == EXITED    ? NOS_LAUNCH_EXITED
                                 : tasks[app].state == EXPIRED ? NOS_LAUNCH_TIMED_OUT
@@ -819,7 +886,8 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         /* A dead client cannot leave an open transaction or stale reply behind. */
         (void)process_file_request(&q, &r);
     }
-    ok = ok && pmm_available() == before;
+    uint64_t ai_pages_after = parked_ai.space.count + parked_ai.space.heap_pages;
+    ok = ok && pmm_available() + ai_pages_after == before + ai_pages_before;
 done:
     interactive = false;
     if (flags & 512)
@@ -881,6 +949,101 @@ static bool create_ai(void) {
     parked_ai.caps[3] = (struct capability){3, 16};
     return true;
 }
+static void discard_ai_job(void) {
+    if (!ai_job_active)
+        return;
+    /* Called only on the desktop/kernel stack, never on either freed task. */
+    user_space_destroy(&tasks[2].space);
+    user_space_destroy(&tasks[3].space);
+    tasks[2] = tasks[3] = (struct task){0};
+    endpoints[2] = endpoints[3] = (struct endpoint){0};
+    ai_job_active = false;
+    task_count = 2;
+}
+static long desktop_ai_job(struct task *desktop, uint64_t op, uint64_t address, uint64_t bytes) {
+    if (!desktop->desktop || current != 1)
+        return -1;
+    if (!ai_server_code)
+        return -19;
+    if (op == AI_JOB_START) {
+        if (ai_job_active || task_count != 2)
+            return -16;
+        struct ai_request request;
+        if (bytes != sizeof(request) ||
+            !user_copy_from(&desktop->space, &request, address, sizeof(request)))
+            return -14;
+        if (request.op != AI_GENERATE || !request.steps || request.steps > AI_STEPS ||
+            request.prompt[55])
+            return -22;
+        uint64_t entry;
+        tasks[3] = (struct task){0};
+        if (!user_space_elf(&tasks[3].space, ai_client_code, ai_client_bytes, &entry))
+            return -12;
+        desktop_ai = (struct ai_session){.request = request};
+        if (!user_copy_to(&tasks[3].space, USER_STACK + 0x100, &desktop_ai, sizeof(desktop_ai)) ||
+            (!parked_ai.space.root && !create_ai())) {
+            user_space_destroy(&tasks[3].space);
+            return -5;
+        }
+        tasks[2] = parked_ai;
+        parked_ai = (struct task){0}; /* Transfer ownership, not another address space. */
+        tasks[2].ticks = 0;
+        tasks[2].caps[1] = (struct capability){2, RECEIVE};
+        tasks[2].caps[2] = (struct capability){3, SEND};
+        fpu_init(&tasks[3].fp);
+        tasks[3].context = (struct cpu_context){.rip = entry,
+                                                .cs = 0x33,
+                                                .ss = 0x2b,
+                                                .flags = 0x202,
+                                                .rsp = USER_ELF_STACK_TOP - 16,
+                                                .rdi = USER_STACK + 0x100};
+        tasks[3].caps[1] = (struct capability){2, SEND};
+        tasks[3].caps[2] = (struct capability){3, RECEIVE};
+        endpoints[2] = (struct endpoint){.owner = 2, .producer = 3};
+        endpoints[3] = (struct endpoint){.owner = 3, .producer = 2};
+        ai_job_request = request;
+        ai_job_active = true;
+        task_count = 4;
+        return 0;
+    }
+    if (op == AI_JOB_POLL) {
+        if (bytes != sizeof(desktop_ai))
+            return -22;
+        if (!ai_job_active)
+            return -2;
+        if (task_alive(&tasks[3]))
+            return 0;
+        desktop_ai = (struct ai_session){.request = ai_job_request, .status = -5};
+        bool ok = tasks[3].state == EXITED && !tasks[3].status &&
+                  (tasks[2].state == READY || tasks[2].state == WAITING) && !endpoints[2].count &&
+                  !endpoints[3].count;
+        if (ok)
+            ok = user_copy_from(&tasks[3].space, &desktop_ai, USER_STACK + 0x100,
+                                sizeof(desktop_ai));
+        /* An invalid destination must not consume the result or free its tasks. */
+        if (!user_copy_to(&desktop->space, address, &desktop_ai, sizeof(desktop_ai)))
+            return -14;
+        if (ok) {
+            parked_ai = tasks[2];
+            resume_wait(&parked_ai);
+            tasks[2] = (struct task){0};
+        } else
+            console_write("AI SERVICE STOPPED - KERNEL ALIVE\n");
+        discard_ai_job();
+        return 1;
+    }
+    if (op == AI_JOB_CANCEL || op == AI_JOB_UNLOAD) {
+        if (bytes || address)
+            return -22;
+        discard_ai_job();
+        user_space_destroy(&parked_ai.space);
+        parked_ai = (struct task){0};
+        ai_started = false;
+        ai_restarts = 0;
+        return 0;
+    }
+    return -22;
+}
 bool process_ai_request(struct ai_session *session) {
     uint64_t flags;
     __asm__ volatile("pushfq;popq %0;cli" : "=r"(flags)::"memory");
@@ -889,6 +1052,8 @@ bool process_ai_request(struct ai_session *session) {
         goto done;
     tasks[0] = parked_ai;
     tasks[0].ticks = 0;
+    tasks[0].caps[1] = (struct capability){0, RECEIVE};
+    tasks[0].caps[2] = (struct capability){1, SEND};
     tasks[1] = (struct task){0};
     uint64_t entry;
     if (!user_space_elf(&tasks[1].space, ai_client_code, ai_client_bytes, &entry))
@@ -920,6 +1085,7 @@ bool process_ai_request(struct ai_session *session) {
     paging_switch(tasks[0].space.root);
     process_enter(&tasks[0].context, &saved_kernel_rsp);
     fpu_end();
+    resume_wait(&tasks[0]);
     ok = tasks[1].state == EXITED && !tasks[1].status && tasks[0].state == READY &&
          !endpoints[0].count && !endpoints[1].count &&
          user_copy_from(&tasks[1].space, session, boot, sizeof(*session));

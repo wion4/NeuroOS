@@ -17,6 +17,9 @@ static inline long send_message(unsigned cap, const void *message, size_t bytes)
 static inline long receive_message(unsigned cap, void *message, size_t bytes) {
     return call3(8, cap, (uintptr_t)message, bytes);
 }
+static inline long receive_wait(unsigned cap, void *message, size_t bytes) {
+    return call3(16, cap, (uintptr_t)message, bytes);
+}
 static inline void say(const char *s) {
     size_t n = 0;
     while (s[n])

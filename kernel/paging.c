@@ -212,7 +212,7 @@ static uint64_t user_writable(const struct user_space *s, uint64_t va) {
         t = table(e & ADDRESS_MASK);
     }
 }
-bool user_copy_to(const struct user_space *s, uint64_t dst, const void *src, size_t bytes) {
+bool user_check_write(const struct user_space *s, uint64_t dst, size_t bytes) {
     if (dst >= (1ull << 47) || bytes > (1ull << 47) - dst)
         return false;
     /* Validate the entire destination before any write: errors are atomic. */
@@ -224,6 +224,11 @@ bool user_copy_to(const struct user_space *s, uint64_t dst, const void *src, siz
             n = bytes - done;
         done += n;
     }
+    return true;
+}
+bool user_copy_to(const struct user_space *s, uint64_t dst, const void *src, size_t bytes) {
+    if (!user_check_write(s, dst, bytes))
+        return false;
     const uint8_t *in = src;
     while (bytes) {
         uint64_t phys = user_writable(s, dst);

@@ -22,6 +22,7 @@ bool user_space_create(struct user_space *space, const void *code, size_t bytes,
 void user_space_destroy(struct user_space *space);
 bool user_copy_from(const struct user_space *space, void *dst, uint64_t src, size_t bytes);
 bool user_copy_to(const struct user_space *space, uint64_t dst, const void *src, size_t bytes);
+bool user_check_write(const struct user_space *space, uint64_t dst, size_t bytes);
 bool user_space_elf(struct user_space *space, const void *file, size_t bytes, uint64_t *entry);
 void paging_switch(uint64_t address_space);
 uint64_t paging_kernel_root(void);

@@ -22,7 +22,8 @@ def main():
     if '--desktop' in sys.argv:
         commands += [['tests/test_text.py'],['tests/test_desktop.py'],['tests/test_desktop_workflow.py']]
     if '--ai' in sys.argv:
-        commands += [['tests/test_ai_guest.py'],['tests/test_ai_desktop.py']]
+        commands += [['tests/test_ai_guest.py'],['tests/test_ai_desktop.py'],['tests/test_ai_background.py'],
+                     ['tests/test_build_variants.py']]
     for index,command in enumerate(commands):
         name='-'.join(Path(part).stem.lstrip('-') for part in command)
         print('CHECK:',name,flush=True)

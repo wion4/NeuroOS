@@ -43,7 +43,7 @@ with DesktopGuest(neuro,target,folder) as g:
     (folder/'serial.log').write_bytes(g.log.read_bytes())
 assert snapshot_files(disk)['note001.txt']==text.encode()
 report.write_text(json.dumps({'passed':True,'checks':['128 MiB boot without network',
-    'GUI invokes separate model service','real fault while GUI is suspended is contained',
+    'GUI invokes separate model service','real background runtime fault is contained',
     'next request reloads and generates','two prompts and rendered output',
     'unload frees cached model pages','unsaved Notes preserved byte-for-byte']},indent=2)+'\n')
 print('PASS: offline AI GUI, real runtime fault, recovery, unload and unsaved note preservation')

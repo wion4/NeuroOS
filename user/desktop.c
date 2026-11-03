@@ -71,7 +71,7 @@ static unsigned program_scroll;
 static struct desktop_launch_result program_result;
 static char ai_prompt[56] = "Once upon a time";
 static struct ai_session ai_result;
-static bool ai_has_result;
+static bool ai_has_result, ai_busy;
 static unsigned ai_scroll;
 static void paint(void);
 static void message(const char *s) {
@@ -540,6 +540,10 @@ static void build_source(const char *name) {
         "Compiler needs file access: enable it, then Run. Existing files are preserved on error.");
 }
 static void run_program(void) {
+    if (ai_busy) {
+        message("Wait for AI generation, or cancel it in AI demo before running a program.");
+        return;
+    }
     if (!program_suffix(program_name)) {
         message("Choose an executable with the .nos extension.");
         return;
@@ -658,23 +662,55 @@ static void draw_programs(struct window *w) {
 static void ai_action(bool unload) {
     struct ai_request request = {.op = unload ? AI_UNLOAD : AI_GENERATE, .steps = 48};
     snprintf(request.prompt, sizeof(request.prompt), "%s", ai_prompt);
+    if (unload) {
+        long e = call3(15, ai_busy ? AI_JOB_CANCEL : AI_JOB_UNLOAD, 0, 0);
+        if (e < 0) {
+            message("Could not release the AI process. Try again.");
+            return;
+        }
+        say(ai_busy ? "AI GUI CANCELLED\n" : "AI GUI UNLOADED\n");
+        message(ai_busy ? "Generation cancelled. Its process memory was released."
+                        : "AI model unloaded. Its process memory was released.");
+        ai_busy = ai_has_result = false;
+        return;
+    }
+    if (ai_busy) {
+        message("Generation is running. You can keep working, or click Cancel.");
+        return;
+    }
+    long e = call3(15, AI_JOB_START, (uintptr_t)&request, sizeof(request));
+    if (e < 0) {
+        message("AI request could not start. Your notes are preserved.");
+        say("AI GUI ERROR\n");
+        return;
+    }
+    ai_busy = true;
     ai_has_result = false;
-    message(unload ? "Unloading cached AI model..."
-                   : "Generating locally on CPU. This is a tiny English text demo.");
-    paint();
-    long e = call3(14, (uintptr_t)&request, (uintptr_t)&ai_result, sizeof(request));
     ai_scroll = 0;
+    message("Generating in the background. Notes and files remain available.");
+    say("AI GUI STARTED\n");
+}
+static void ai_poll(void) {
+    if (!ai_busy)
+        return;
+    long e = call3(15, AI_JOB_POLL, (uintptr_t)&ai_result, sizeof(ai_result));
+    if (!e)
+        return;
+    ai_busy = false;
     if (e < 0 || ai_result.status) {
         message("AI request failed. Desktop and notes are preserved.");
         say("AI GUI ERROR\n");
         return;
     }
-    ai_has_result = !unload;
-    message(unload ? "AI model unloaded. Its process memory was released."
-                   : "Generated offline. This test model has no access to your files.");
-    say(unload ? "AI GUI UNLOADED\n" : "AI GUI COMPLETE\n");
+    ai_has_result = true;
+    message("Generated offline. This test model has no access to your files.");
+    say("AI GUI COMPLETE\n");
 }
 static void ai_key(uint32_t key) {
+    if (key == 27 && ai_busy) {
+        ai_action(true);
+        return;
+    }
     unsigned length = (unsigned)strlen(ai_prompt);
     if (key == '\n') {
         ai_action(false);
@@ -730,14 +766,16 @@ static void draw_ai(struct window *w) {
     text(x + 10, y + 39, ai_prompt, 1, INK);
     unsigned length = (unsigned)strlen(ai_prompt);
     rect(x + 10 + (int)length * 6, y + 35, 1, 15, accent);
-    button(x, y + 70, 110, "Generate", true);
-    button(x + 122, y + 70, 100, "Unload", false);
+    button(x, y + 70, 110, ai_busy ? "Running..." : "Generate", true);
+    button(x + 122, y + 70, 100, ai_busy ? "Cancel" : "Unload", false);
     rect(x, y + 112, w->w - 40, 200, BG);
     if (ai_has_result) {
         (void)ai_text_layout(w, true);
     } else
-        text(x + 12, y + 132, "No generated text yet.", 1, MUTED);
-    text(x, y + 337, "Offline CPU / 260K parameters / no file or disk-port rights", 1, MUTED);
+        text(x + 12, y + 132,
+             ai_busy ? "Generating. You can use the other windows." : "No generated text yet.", 1,
+             MUTED);
+    text(x, y + 337, "Ctrl+Alt+G: generate from any window / Esc: cancel", 1, MUTED);
     button(x + 400, y + 324, 76, "Up", false);
     button(x + 486, y + 324, 76, "Down", false);
 }
@@ -1168,6 +1206,7 @@ int user_main(void) {
     say("DESKTOP READY\n");
     struct desktop_input old = {.x = -1, .y = -1};
     while (!exiting) {
+        ai_poll();
         if (call3(11, 0, (uintptr_t)&input, 0) < 0) {
             free(pixels);
             return 2;
@@ -1208,6 +1247,14 @@ int user_main(void) {
         uint32_t key = keyboard_translate(&layout, &input);
         if (was_ru != layout.russian)
             redraw = true;
+        if (!dialog && input.scancode == 0x10 &&
+            (input.modifiers & (INPUT_CONTROL | INPUT_ALT)) == (INPUT_CONTROL | INPUT_ALT))
+            request_exit();
+#if NEUROOS_AI_DEMO
+        if (!dialog && input.scancode == 0x22 &&
+            (input.modifiers & (INPUT_CONTROL | INPUT_ALT)) == (INPUT_CONTROL | INPUT_ALT))
+            ai_action(false);
+#endif
         if (key) {
             if (dialog) {
                 if (key == 27)

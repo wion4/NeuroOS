@@ -8,6 +8,12 @@
 #define AI_TEXT 3u
 #define AI_TRACE 4u
 #define AI_UNLOAD 5u
+/* Desktop-only syscall 15. START copies the request; POLL copies a complete
+   session only when it returns 1. No user pointer is retained across calls. */
+#define AI_JOB_START 0u
+#define AI_JOB_POLL 1u
+#define AI_JOB_CANCEL 2u
+#define AI_JOB_UNLOAD 3u
 struct ai_request {
     uint32_t op, steps;
     char prompt[56];

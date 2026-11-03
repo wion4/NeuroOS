@@ -6,7 +6,7 @@ static int rpc(struct fs_message *q, struct fs_message *r) {
         yield();
     if (n < 0)
         return -1;
-    while ((n = receive_message(2, r, sizeof(*r))) == -11)
+    while ((n = receive_wait(2, r, sizeof(*r))) == -11)
         yield();
     return n == sizeof(*r) ? 0 : -1;
 }
@@ -39,11 +39,11 @@ int user_main(struct fs_message *boot) {
         return 21; /* Read-only code must not be overwritten. */
     volatile uint64_t *edge = (volatile uint64_t *)0x80fff0; /* End of the 64 KiB ELF stack. */
     *edge = 0xabcdef1234567890ull;
-    if (receive_message(2, (void *)edge, 64) != -14 || *edge != 0xabcdef1234567890ull)
+    if (receive_wait(2, (void *)edge, 64) != -14 || *edge != 0xabcdef1234567890ull)
         return 22; /* Cross-page rejection must leave the valid prefix unchanged. */
-    if (receive_message(2, &r, 32) != -90)
+    if (receive_wait(2, &r, 32) != -90)
         return 23;
-    if (receive_message(2, &r, sizeof(r)) != sizeof(r) || r.status)
+    if (receive_wait(2, &r, sizeof(r)) != sizeof(r) || r.status)
         return 24;
     if (rpc(&q, &r) || r.status != -17)
         return 4;
