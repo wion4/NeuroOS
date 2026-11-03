@@ -78,12 +78,50 @@ def main():
                 def command(text, expected, timeout=20):
                     start = log.stat().st_size
                     type_text(text+'\n')
-                    data = wait_for(expected, start, timeout)
-                    wait_for(b'> ', start)
-                    return data
+                    wait_for(expected, start, timeout)
+                    wait_for(b'\r\n> ', start, timeout)
+                    return log.read_bytes()[start:]
                 def success(message):
                     (target/'shell-test.json').write_text(json.dumps({'passed':True,'scenario':sys.argv[1:]})+'\n')
                     print(message)
+                if '--sdk-auto-first' in sys.argv:
+                    assert b'SDK INSTALLED 21 FILES' in log.read_bytes()
+                    command('stat libnos.a',b'BYTES');command('stat stdio.h',b'BYTES')
+                    success('PASS: configured bootstrap installed the SDK inside the guest')
+                    return
+                if '--sdk-auto-read' in sys.argv:
+                    assert b'SDK AVAILABLE' in log.read_bytes()
+                    assert b'SDK INSTALLED' not in log.read_bytes()
+                    command('stat libnos.a',b'BYTES')
+                    success('PASS: SDK bootstrap skips existing files after cold boot')
+                    return
+                if '--supervisor' in sys.argv:
+                    command('write durable safe data',b'WROTE 9 BYTES')
+                    baseline=command('mem',b'HEAP FREE BYTES')
+                    recovered=command('recoverytest',b'SERVICE RECOVERY PASS - KERNEL ALIVE')
+                    assert b'FILESYSTEM SERVICE RECOVERED' in recovered
+                    io=command('iofaulttest',b'IO SERVICE RECOVERY PASS - DATA INTACT',timeout=60)
+                    assert b'TASK 0 FAULT 14 CONTAINED' in io and b'FILESYSTEM SERVICE RECOVERED' in io
+                    command('install filedemo.nos',b'INSTALLED filedemo.nos')
+                    command('runfs filedemo.nos protocol',b'C PROTOCOL DEFENSE PASS')
+                    stale=command('runfs filedemo.nos backlog',b'FILESYSTEM SERVICE RECOVERED')
+                    assert b'FILESYSTEM CLIENT SESSION DISCARDED' in stale
+                    command('cat durable',b'safe data\r\n')
+                    limited=command('recoverytest',b'FILESYSTEM RESTART LIMIT - USE restartfs')
+                    assert b'SERVICE RECOVERY FAIL' in limited
+                    unavailable=command('cat durable',b'ERROR: filesystem service unavailable')
+                    assert b'AUTO RESTART ATTEMPT' not in unavailable
+                    command('restartfs',b'FILESYSTEM SERVICE RESTARTED')
+                    command('cat durable',b'safe data\r\n')
+                    command('rm filedemo.nos',b'OK')
+                    final=command('mem',b'HEAP FREE BYTES')
+                    assert re.search(rb'PAGES FREE (\d+)',baseline)[1]==re.search(rb'PAGES FREE (\d+)',final)[1]
+                    success('PASS: supervisor, real mid-PIO fault/reset, malformed IPC, stale sessions, restart limit and no leaks')
+                    return
+                if '--supervisor-read' in sys.argv:
+                    command('cat durable',b'safe data\r\n')
+                    success('PASS: supervised recovery retained committed data after cold boot')
+                    return
                 if '--fs3-write' in sys.argv:
                     assert b'PERSISTENT FS3 FILE SERVICE READY' in log.read_bytes()
                     assert b'STORAGE LEGACY IMPORTED INTO V3' in log.read_bytes()
@@ -370,7 +408,7 @@ def main():
                     success('PASS: file recovered after cold guest restart')
                     return
                 command('help', b'alloc PAGES')
-                command('info', b'NeuroOS 0.0.13')
+                command('info', f'NeuroOS {neuro.VERSION}'.encode())
                 initial = command('mem', b'HEAP FREE BYTES')
                 command('alloc 2', b'ALLOCATED ID 0')
                 command('heap 33', b'ALLOCATED ID 1')

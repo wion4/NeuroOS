@@ -3,6 +3,8 @@
 #include "alloc.h"
 #include "exceptions.h"
 #include "fpu.h"
+#include "display.h"
+#include "../user/desktop.h"
 #include "io.h"
 #include "paging.h"
 #include "shell.h"
@@ -24,6 +26,7 @@ struct task {
     struct capability caps[4];
     enum state state;
     unsigned ticks;
+    bool ipc_idle, desktop;
     uint64_t fault, error, address, status;
 };
 static struct task tasks[TASKS];
@@ -34,13 +37,17 @@ static bool receiver_after_fault;
 static uint64_t mailbox, saved_kernel_rsp;
 static unsigned task_count = TASKS, budget = 8;
 static bool interactive;
+static bool desktop_launch;
 static struct task parked_server;
 void process_filesystem_inject_fault(void) {
     if (parked_server.space.root)
         parked_server.context.rip = 0;
 }
-static const void *file_client;
-static uint64_t file_client_size;
+static const void *file_client, *file_server;
+static uint64_t file_client_size, file_server_size;
+static unsigned automatic_restarts, fault_after_io;
+static bool restart_limit_reported;
+void process_filesystem_fault_after_io(unsigned operations) { fault_after_io = operations; }
 struct message {
     uint8_t data[64];
     uint64_t size, sender;
@@ -156,6 +163,9 @@ static void syscall(struct task *task) {
             m->sender = current;
             ++ep->count;
             ++sent;
+            if (task->caps[3].endpoint == 2 && task->caps[3].rights == 4 &&
+                task->caps[f->rdi].endpoint == 1 && f->rdx == 64)
+                task->ipc_idle = true; /* The trusted server has finished this request. */
         } else {
             if (!ep->count) {
                 f->rax = (uint64_t)(tasks[ep->producer].state == READY ? -11 : -32);
@@ -176,6 +186,8 @@ static void syscall(struct task *task) {
             ep->head = (ep->head + 1) % 8;
             --ep->count;
             ++received;
+            if (task->caps[3].endpoint == 2 && task->caps[3].rights == 4)
+                task->ipc_idle = false;
         }
         break;
     }
@@ -203,6 +215,8 @@ static void syscall(struct task *task) {
             io_out((uint16_t)port, (uint8_t)f->rdx);
         else
             __asm__ volatile("outw %0,%1" ::"a"((uint16_t)f->rdx), "Nd"((uint16_t)port));
+        if ((op == 1 || op == 3) && fault_after_io && !--fault_after_io)
+            f->rip = 0; /* Real user #PF after a word transfer, while DRQ is pending. */
         break;
     }
     case 10:
@@ -213,6 +227,30 @@ static void syscall(struct task *task) {
         else
             f->rax = USER_HEAP + (uint64_t)task->space.heap_pages * 4096;
         break;
+    case 11: {
+        if (!task->desktop) { f->rax = (uint64_t)-1; break; }
+        if (f->rdi == 0) {
+            struct desktop_input input;
+            desktop_input_poll(&input);
+            if (!user_copy_to(&task->space, f->rsi, &input, sizeof(input)))
+                f->rax = (uint64_t)-14;
+        } else if (f->rdi == 1)
+            f->rax = (uint64_t)display_present(&task->space, f->rsi, f->rdx);
+        else f->rax = (uint64_t)-22;
+        break;
+    }
+    case 12: {
+        if (!task->desktop) { f->rax = (uint64_t)-1; break; }
+        /* Trusted foreground desktop sleeps with interrupts on. The filesystem
+           has no pending work here: all UI file calls finish synchronously. */
+        if (f->rdi > 10) { f->rax = (uint64_t)-22; break; }
+        task->ticks = 0;
+        if (tasks[0].ipc_idle) tasks[0].ticks = 0;
+        uint64_t end = timer_ticks() + f->rdi;
+        while (timer_ticks() < end)
+            __asm__ volatile("sti; hlt; cli" ::: "memory");
+        break;
+    }
     default:
         ++unknown_calls;
         f->rax = (uint64_t)-38;
@@ -423,13 +461,10 @@ bool process_services(const void *server, uint64_t server_size, const void *clie
     return ok;
 }
 
-bool process_filesystem_init(const void *server, uint64_t server_size, const void *client,
-                             uint64_t client_size) {
-    if (parked_server.space.root)
-        return true;
+static bool create_filesystem(void) {
     parked_server = (struct task){0};
     uint64_t entry;
-    if (!user_space_elf(&parked_server.space, server, server_size, &entry))
+    if (!user_space_elf(&parked_server.space, file_server, file_server_size, &entry))
         return false;
     fpu_init(&parked_server.fp);
     parked_server.context = (struct cpu_context){
@@ -437,16 +472,59 @@ bool process_filesystem_init(const void *server, uint64_t server_size, const voi
     parked_server.caps[1] = (struct capability){0, RECEIVE};
     parked_server.caps[2] = (struct capability){1, SEND};
     parked_server.caps[3] = (struct capability){2, 4};
+    return true;
+}
+bool process_filesystem_init(const void *server, uint64_t server_size, const void *client,
+                             uint64_t client_size) {
+    if (parked_server.space.root)
+        return true;
+    file_server = server;
+    file_server_size = server_size;
     file_client = client;
     file_client_size = client_size;
-    return true;
+    return create_filesystem();
+}
+bool process_filesystem_restart(void) {
+    if (running || !file_server)
+        return false;
+    user_space_destroy(&parked_server.space);
+    automatic_restarts = fault_after_io = 0;
+    restart_limit_reported = false;
+    return create_filesystem();
+}
+static void park_filesystem(void) {
+    parked_server = tasks[0];
+    if (parked_server.state == READY && parked_server.ipc_idle && !endpoints[0].count &&
+        !endpoints[1].count)
+        return;
+    user_space_destroy(&parked_server.space);
+    fault_after_io = 0;
+    console_write(parked_server.state == READY ? "FILESYSTEM CLIENT SESSION DISCARDED\n"
+                                               : "ERROR: FILESYSTEM SERVICE STOPPED\n");
 }
 bool process_file_request(const void *request, void *response) {
     uint64_t flags, old_cr0;
     __asm__ volatile("pushfq;popq %0;cli;mov %%cr0,%1" : "=r"(flags), "=r"(old_cr0)::"memory");
     bool ok = false;
-    if (running || !parked_server.space.root)
+    if (running)
         goto done;
+    bool restarted = false;
+    if (!parked_server.space.root) {
+        if (!file_server)
+            goto done;
+        if (automatic_restarts >= 3) {
+            if (!restart_limit_reported)
+                console_write("FILESYSTEM RESTART LIMIT - USE restartfs\n");
+            restart_limit_reported = true;
+            goto done;
+        }
+        console_write("FILESYSTEM AUTO RESTART ATTEMPT ");
+        console_number(++automatic_restarts);
+        console_write(" OF 3\n");
+        if (!create_filesystem())
+            goto done;
+        restarted = true;
+    }
     task_count = 2;
     budget = 1000;
     interactive = true;
@@ -481,14 +559,12 @@ bool process_file_request(const void *request, void *response) {
     process_enter(&tasks[0].context, &saved_kernel_rsp);
     fpu_end();
     ok = tasks[1].state == EXITED && !tasks[1].status && tasks[0].state == READY &&
-         !endpoints[0].count && !endpoints[1].count &&
+         tasks[0].ipc_idle && !endpoints[0].count && !endpoints[1].count &&
          user_copy_from(&tasks[1].space, response, boot, 64);
-    parked_server = tasks[0];
-    if (parked_server.state != READY) {
-        user_space_destroy(&parked_server.space);
-        console_write("ERROR: RAMFS SERVICE STOPPED\n");
-    }
+    park_filesystem();
     user_space_destroy(&tasks[1].space);
+    if (ok && restarted)
+        console_write("FILESYSTEM SERVICE RECOVERED\n");
 done:
     interactive = false;
     if (flags & 512)
@@ -511,6 +587,7 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         tasks[0].ticks = 0;
     }
     tasks[app] = (struct task){0};
+    tasks[app].desktop = desktop_launch;
     if (!user_space_elf(&tasks[app].space, file, size, &entry)) {
         console_write("ERROR: invalid or unsupported NOS executable\n");
         goto done;
@@ -551,20 +628,24 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
     } else
         console_write("PROGRAM TERMINATED - KERNEL ALIVE\n");
     if (file_access) {
-        parked_server = tasks[0];
-        if (parked_server.state != READY)
-            user_space_destroy(&parked_server.space);
+        park_filesystem();
     }
     user_space_destroy(&tasks[app].space);
-    ok = ok && pmm_available() == before;
-    if (file_access && parked_server.space.root) {
+    if (file_access && file_server) {
         struct fs_message q = {.op = FS_ABORT}, r;
         /* A dead client cannot leave an open transaction or stale reply behind. */
         (void)process_file_request(&q, &r);
     }
+    ok = ok && pmm_available() == before;
 done:
     interactive = false;
     if (flags & 512)
         __asm__ volatile("sti" ::: "memory");
+    return ok;
+}
+bool process_run_desktop(const void *file, uint64_t size) {
+    desktop_launch = true;
+    bool ok = process_run_file(file, size, "", true);
+    desktop_launch = false;
     return ok;
 }

@@ -4,6 +4,9 @@ static uint8_t backup[FS_SNAPSHOT_SIZE];
 static bool transaction;
 int user_main(void) {
     fs_reset();
+    long device = call3(9, 3, 0x1f7, 0);
+    if (device >= 0 && device != 0 && device != 255 && !storage_reset())
+        return 4;
     int disk = storage_load();
     if (disk == -2) {
         say("STORAGE CORRUPT - WRITES DISABLED\n");
@@ -18,9 +21,14 @@ int user_main(void) {
             yield();
             continue;
         }
-        if (n != sizeof(request))
+        if (n < 0)
             return 1;
-        if (request.op == 9)
+        bool complete = n == sizeof(request);
+        if (!complete)
+            response = (struct fs_message){.status = -22};
+        else if (persistent && request.op == FS_QUIT)
+            response = (struct fs_message){.op = FS_QUIT, .status = -1};
+        else if (request.op == 9)
             response = (struct fs_message){.op = 9, .size = persistent ? 1 : 0};
         else if (request.op == FS_BEGIN) {
             response = (struct fs_message){.op = FS_BEGIN, .status = transaction ? -16 : 0};
@@ -56,7 +64,7 @@ int user_main(void) {
             yield();
         if (n < 0)
             return 2;
-        if (request.op == FS_QUIT && response.status == 0)
+        if (complete && request.op == FS_QUIT && response.status == 0)
             return 0;
     }
 }

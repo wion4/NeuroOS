@@ -62,6 +62,16 @@ long call3(uint64_t call, uint64_t a, uint64_t b, uint64_t c) {
     unsigned port = (unsigned)b & 65535, op = (unsigned)(b >> 16);
     if (op == 0 && (port == 0x1f7 || port == 0x3f6))
         return status();
+    if (op == 2 && port == 0x3f6) {
+        if (c == 6) {
+            phase = IDLE;
+            delay = latency = words = 0;
+            return 0;
+        }
+        if (c == 2)
+            return 0;
+        return -1;
+    }
     if (op == 2 && port >= 0x1f2 && port <= 0x1f6) {
         registers[port - 0x1f0] = (unsigned)c;
         return 0;
@@ -111,3 +121,9 @@ bool ata_test_read(unsigned lba, void *data) { return sector(lba, data, false); 
 bool ata_test_write(unsigned lba, void *data) { return sector(lba, data, true); }
 bool ata_test_flush(void) { return flush(); }
 bool ata_test_ready(bool data) { return ready(data); }
+bool ata_test_leave_transfer(void) {
+    if (port(2, 0x1f7, 0x20) < 0)
+        return false;
+    settle();
+    return ready(true) && port(1, 0x1f0, 0) >= 0;
+}

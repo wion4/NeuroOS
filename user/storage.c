@@ -82,6 +82,22 @@ bool storage_write_sector(uint32_t lba, const void *buffer) {
     return sector(lba, (void *)buffer, true);
 }
 bool storage_flush(void) { return flush(); }
+static void reset_delay(void) {
+    uint64_t start = (uint64_t)call3(5, 0, 0, 0);
+    /* Two PIT ticks guarantee >5 us assertion and >2 ms after clearing SRST. */
+    while ((uint64_t)call3(5, 0, 0, 0) - start < 2)
+        yield();
+}
+bool storage_reset(void) {
+    if (port(2, 0x3f6, 6) < 0)
+        return false; /* SRST | nIEN */
+    reset_delay();
+    if (port(2, 0x3f6, 2) < 0)
+        return false; /* Keep device IRQs disabled for PIO polling. */
+    reset_delay();
+    settle();
+    return ready(false);
+}
 static uint32_t crc(const uint8_t *p, unsigned n) {
     uint32_t c = ~0u;
     while (n--) {

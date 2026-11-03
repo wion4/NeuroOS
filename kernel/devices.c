@@ -1,6 +1,11 @@
+#include "../user/desktop.h"
 #include "io.h"
 #include <stdbool.h>
 static volatile uint64_t ticks;
+static int mouse_x = 400, mouse_y = 300;
+static unsigned mouse_buttons, mouse_sequence, mouse_index;
+static uint8_t mouse_packet[3];
+static bool mouse_ready;
 static void wait_io(void) { io_out(0x80, 0); }
 void timer_irq(void) {
     ++ticks;
@@ -86,8 +91,58 @@ bool keyboard_init(void) {
     return keyboard_command(0xf5) && keyboard_command(0xf0) && keyboard_command(2) &&
            keyboard_command(0xf4);
 }
+bool mouse_init(void) {
+    if (mouse_ready)
+        return true;
+    if (!send(0x64, 0xa8))
+        return false;
+    const uint8_t commands[] = {0xf6, 0xf4};
+    for (unsigned i = 0; i < sizeof(commands); ++i) {
+        if (!send(0x64, 0xd4) || !send(0x60, commands[i]))
+            return false;
+        bool ack = false;
+        for (unsigned j = 0; j < 100000; ++j) {
+            uint8_t status = io_in(0x64);
+            if (status & 1) {
+                uint8_t value = io_in(0x60);
+                if ((status & 0xe0) == 0x20 && value == 0xfa) {
+                    ack = true;
+                    break;
+                }
+            }
+            __asm__ volatile("pause");
+        }
+        if (!ack)
+            return false;
+    }
+    mouse_ready = true;
+    return true;
+}
+static void mouse_byte(uint8_t value) {
+    if (!mouse_ready || (!mouse_index && !(value & 8)))
+        return;
+    mouse_packet[mouse_index++] = value;
+    if (mouse_index != 3)
+        return;
+    mouse_index = 0;
+    unsigned flags = mouse_packet[0];
+    if (!(flags & 0xc0)) {
+        mouse_x += (int)mouse_packet[1] - ((flags & 0x10) ? 256 : 0);
+        mouse_y -= (int)mouse_packet[2] - ((flags & 0x20) ? 256 : 0);
+        if (mouse_x < 0)
+            mouse_x = 0;
+        if (mouse_x >= (int)DESKTOP_WIDTH)
+            mouse_x = DESKTOP_WIDTH - 1;
+        if (mouse_y < 0)
+            mouse_y = 0;
+        if (mouse_y >= (int)DESKTOP_HEIGHT)
+            mouse_y = DESKTOP_HEIGHT - 1;
+    }
+    mouse_buttons = flags & 7;
+    ++mouse_sequence;
+}
 char keyboard_poll(void) {
-    static bool left_shift, right_shift, caps;
+    static bool left_shift, right_shift, caps, control;
     static bool extended;
     static unsigned pause_bytes;
     static const char keys[128] = {
@@ -103,8 +158,12 @@ char keyboard_poll(void) {
     if (!(status & 1))
         return 0;
     uint8_t code = io_in(0x60);
-    if (status & 0xe0)
+    if (status & 0xc0)
         return 0;
+    if (status & 0x20) {
+        mouse_byte(code);
+        return 0;
+    }
     if (pause_bytes) {
         --pause_bytes;
         return 0;
@@ -119,6 +178,14 @@ char keyboard_poll(void) {
     }
     if (extended) {
         extended = false;
+        if (code == 0x48)
+            return (char)0x81;
+        if (code == 0x50)
+            return (char)0x82;
+        if (code == 0x4b)
+            return (char)0x83;
+        if (code == 0x4d)
+            return (char)0x84;
         return 0;
     }
     if (code == 0x2a || code == 0xaa) {
@@ -133,9 +200,17 @@ char keyboard_poll(void) {
         caps = !caps;
         return 0;
     }
+    if (code == 0x1d || code == 0x9d) {
+        control = code == 0x1d;
+        return 0;
+    }
     if (code & 0x80)
         return 0;
+    if (code == 1)
+        return 27;
     char c = keys[code];
+    if (control && c >= 'a' && c <= 'z')
+        return (char)(c - 'a' + 1);
     bool shift = left_shift || right_shift;
     if (c >= 'a' && c <= 'z')
         return shift != caps ? (char)(c - 'a' + 'A') : c;
@@ -147,4 +222,14 @@ char keyboard_poll(void) {
                 return upper[i];
     }
     return c;
+}
+void desktop_input_poll(struct desktop_input *input) {
+    uint32_t key = 0;
+    unsigned sequence = mouse_sequence;
+    for (unsigned i = 0; i < 128 && (io_in(0x64) & 1); ++i) {
+        key = (unsigned char)keyboard_poll();
+        if (key || mouse_sequence != sequence)
+            break;
+    }
+    *input = (struct desktop_input){mouse_x, mouse_y, mouse_buttons, key, timer_ticks()};
 }

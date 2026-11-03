@@ -15,8 +15,11 @@ bool kernel_service_recovery_test(void);
 bool kernel_install_program(const char *name);
 bool kernel_compile(const char *arguments);
 bool kernel_fs3_test(const char *arguments);
-bool kernel_boot_module(unsigned index,const void **address,uint64_t *bytes);
+bool kernel_boot_module(unsigned index, const void **address, uint64_t *bytes);
 bool kernel_install_sdk(void);
-bool filesystem_store(const char *name,const void *data,unsigned bytes);
+bool kernel_restart_filesystem(void);
+bool kernel_service_io_recovery_test(void);
+bool filesystem_store(const char *name, const void *data, unsigned bytes);
 void editor_run(const char *name);
+bool kernel_desktop(void);
 #endif

@@ -12,6 +12,7 @@ import pycdlib
 
 
 def main():
+    os.environ.setdefault('NEUROOS_DESKTOP','1')
     if os.environ.get('NEUROOS_FS3_TEST')=='1':
         raise SystemExit('Experimental stress builds use their test ESP, not the working VM ISO.')
     if any((neuro.ROOT / 'vmware').glob('*.vmx.lck')):
@@ -23,7 +24,7 @@ def main():
     iso.add_directory('/BOOT', rr_name='boot', joliet_path='/boot')
     iso.add_file(str(target / 'esp/boot/kernel.elf'), '/BOOT/KERNEL.ELF;1',
                  rr_name='kernel.elf', joliet_path='/boot/kernel.elf')
-    for app in ('ramfs','fsclient','hello','filedemo','libcdemo','floatdemo','compiler'):
+    for app in ('ramfs','fsclient','hello','filedemo','libcdemo','floatdemo','compiler','desktop'):
         iso.add_file(str(target/'esp/boot'/f'{app}.nos'),f'/BOOT/{app.upper()}.NOS;1',
                      rr_name=f'{app}.nos',joliet_path=f'/boot/{app}.nos')
     iso.add_file(str(target/'esp/boot/sdk.pack'),'/BOOT/SDK.PAK;1',rr_name='sdk.pack',joliet_path='/boot/sdk.pack')
@@ -42,7 +43,7 @@ def main():
     payload = io.BytesIO()
     check.get_file_from_iso_fp(payload, rr_path='/boot/kernel.elf')
     assert payload.getvalue() == (target / 'esp/boot/kernel.elf').read_bytes()
-    for app in ('ramfs','fsclient','hello','filedemo','libcdemo','floatdemo','compiler'):
+    for app in ('ramfs','fsclient','hello','filedemo','libcdemo','floatdemo','compiler','desktop'):
         content=io.BytesIO();check.get_file_from_iso_fp(content,rr_path=f'/boot/{app}.nos')
         assert content.getvalue()==(target/'esp/boot'/f'{app}.nos').read_bytes()
     content=io.BytesIO();check.get_file_from_iso_fp(content,rr_path='/boot/sdk.pack')

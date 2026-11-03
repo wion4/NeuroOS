@@ -22,7 +22,8 @@ class StorageTests(unittest.TestCase):
                             '-Wall','-Wextra','-Werror','-c',source,'-o',str(obj)],cwd=ROOT,check=True)
             objects.append(str(obj))
         exports=('ata_reset','ata_violations','ata_completed_flushes','ata_test_read',
-                 'ata_test_write','ata_test_flush','ata_test_ready','storage_load','storage_save')
+                 'ata_test_write','ata_test_flush','ata_test_ready','storage_load','storage_save',
+                 'ata_test_leave_transfer','storage_reset')
         subprocess.run([linker,'/dll','/noentry','/nodefaultlib',*objects,
                         *('/export:'+name for name in exports),'/out:'+str(target/'storage.dll')],check=True)
         cls.lib=c.CDLL(str(target/'storage.dll'))
@@ -32,6 +33,8 @@ class StorageTests(unittest.TestCase):
         cls.lib.ata_test_ready.argtypes=[c.c_bool];cls.lib.ata_test_ready.restype=c.c_bool
         cls.lib.ata_test_flush.restype=c.c_bool
         cls.lib.storage_save.restype=c.c_bool
+        cls.lib.ata_test_leave_transfer.restype=c.c_bool
+        cls.lib.storage_reset.restype=c.c_bool
     def test_drq_must_clear_before_next_command(self):
         self.lib.ata_reset(0)
         data=(c.c_uint16*256)(*(i^0x5a5a for i in range(256)))
@@ -57,5 +60,13 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(self.lib.storage_save())
         self.assertEqual(self.lib.ata_violations(),0)
         self.assertEqual(self.lib.ata_completed_flushes(),4)
+    def test_soft_reset_discards_an_unfinished_pio_transfer(self):
+        self.lib.ata_reset(0)
+        self.assertTrue(self.lib.ata_test_leave_transfer())
+        self.assertFalse(self.lib.ata_test_ready(False))
+        self.assertTrue(self.lib.storage_reset())
+        self.assertTrue(self.lib.ata_test_ready(False))
+        self.assertTrue(self.lib.ata_test_flush())
+        self.assertEqual(self.lib.ata_violations(),0)
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -23,7 +23,8 @@ static int stream_test(void) {
     if (fseek(f, -7, SEEK_CUR) != EOF || ftell(f) != 6)
         return 45;
     clearerr(f);
-    if (fseek(f, FS_FILE_LIMIT-1, SEEK_SET) || fwrite("zz", 1, 2, f) || errno != EFBIG || !ferror(f))
+    if (fseek(f, FS_FILE_LIMIT - 1, SEEK_SET) || fwrite("zz", 1, 2, f) || errno != EFBIG ||
+        !ferror(f))
         return 46;
     if (fclose(f))
         return 47;
@@ -108,7 +109,31 @@ int user_main(const char *args) {
     volatile double a = 1.5, b = 2.0;
     if (a * b != 3.0)
         return 5;
-    if(args && args[0]=='f')return test_file_descriptors();
+    if (args && args[0] == 'p') {
+        unsigned char malformed = 0;
+        if (send_message(1, &malformed, 1))
+            return 60;
+        struct fs_message q = {.op = FS_QUIT}, r;
+        long n;
+        while ((n = receive_message(2, &r, sizeof(r))) == -11)
+            yield();
+        if (n != sizeof(r) || r.status != -22)
+            return 61;
+        if (nos_fs_request(&q, &r) != -1)
+            return 62;
+        say("C PROTOCOL DEFENSE PASS\n");
+        return 0;
+    }
+    if (args && args[0] == 'b') {
+        struct fs_message q = {.op = FS_STAT, .name = "durable"};
+        for (unsigned i = 0; i < 8; ++i)
+            if (send_message(1, &q, sizeof(q)))
+                return 63;
+        /* Deliberately leave requests/replies unconsumed at normal exit. */
+        return 0;
+    }
+    if (args && args[0] == 'f')
+        return test_file_descriptors();
     if (args && args[0] == 't')
         return stream_test();
     if (args && (args[0] == 'h' || args[0] == 'n' || args[0] == 's' || args[0] == 'd'))
@@ -142,6 +167,8 @@ int user_main(const char *args) {
             return 3;
     if (call3(9, 3, 0x1f7, 0) != -1)
         return 4;
+    if (call3(11, 0, (uintptr_t)buffer, 0) != -1 || call3(12, 1, 0, 0) != -1)
+        return 5; /* Ordinary NOS files never inherit desktop/input rights. */
     say("C FILE LIBRARY PASS\n");
     return 0;
 }

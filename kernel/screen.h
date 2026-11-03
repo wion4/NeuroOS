@@ -1,4 +1,5 @@
 /* Tiny diagnostic bitmap font, authored for NeuroOS. No GUI or input support. */
+#include "version.h"
 static const uint8_t glyphs[62][7] = {
     {14, 17, 19, 21, 25, 17, 14}, {4, 12, 4, 4, 4, 4, 14},      {14, 17, 1, 2, 4, 8, 31},
     {30, 1, 1, 14, 1, 1, 30},     {2, 6, 10, 18, 31, 2, 2},     {31, 16, 16, 30, 1, 1, 30},
@@ -172,7 +173,7 @@ static bool screen_boot(struct limine_framebuffer *fb, uint64_t usable_mib) {
     for (unsigned y = 0; y < fb->height; ++y)
         for (unsigned x = 0; x < fb->width; ++x)
             screen_pixel(fb, x, y, 0);
-    screen_text(fb, 32, 40, "NEUROOS V0.0.9", 3, green);
+    screen_text(fb, 32, 40, "NEUROOS V" NEUROOS_VERSION, 3, green);
     screen_text(fb, 32, 100, "KERNEL BOOT SUCCESSFUL", 2, white);
     screen_text(fb, 32, 140, "UEFI 64 BIT", 2, white);
     screen_text(fb, 32, 180, "GDT IDT TSS READY", 2, white);

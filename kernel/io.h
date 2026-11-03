@@ -12,4 +12,7 @@ void timer_init(void);
 uint64_t timer_ticks(void);
 bool keyboard_init(void);
 char keyboard_poll(void);
+bool mouse_init(void);
+struct desktop_input;
+void desktop_input_poll(struct desktop_input *input);
 #endif

@@ -29,5 +29,6 @@ bool storage_save(void);
 bool storage_read_sector(uint32_t sector, void *buffer);
 bool storage_write_sector(uint32_t sector, const void *buffer);
 bool storage_flush(void);
+bool storage_reset(void);
 void fs_handle(const struct fs_message *request, struct fs_message *response);
 #endif

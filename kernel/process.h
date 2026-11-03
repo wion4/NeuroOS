@@ -14,5 +14,8 @@ bool process_filesystem_init(const void *server, uint64_t server_size, const voi
                              uint64_t client_size);
 bool process_file_request(const void *request, void *response);
 void process_filesystem_inject_fault(void);
+void process_filesystem_fault_after_io(unsigned operations);
+bool process_filesystem_restart(void);
 bool process_run_file(const void *file, uint64_t size, const char *arguments, bool file_access);
+bool process_run_desktop(const void *file, uint64_t size);
 #endif

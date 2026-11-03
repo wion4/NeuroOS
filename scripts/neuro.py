@@ -12,7 +12,11 @@ import struct
 import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
-MARKER = 'NeuroOS v0.0.13 — Kernel boot successful'.encode('utf-8')
+_version=re.search(r'^#define NEUROOS_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"$',
+                   (ROOT/'kernel/version.h').read_text(),re.MULTILINE)
+if not _version:raise RuntimeError('Invalid kernel version header')
+VERSION=_version.group(1)
+MARKER = f'NeuroOS v{VERSION} — Kernel boot successful'.encode('utf-8')
 
 
 def tool(env, name, candidates=()):
@@ -44,9 +48,13 @@ def build(test=False, fault=0):
     if backend not in ('2','3'):raise RuntimeError('NEUROOS_FS_BACKEND must be 2 or 3')
     fs3=backend=='3'
     fs3_test=fs3 and os.environ.get('NEUROOS_FS3_TEST')=='1'
+    bootstrap_sdk=os.environ.get('NEUROOS_BOOTSTRAP_SDK')=='1'
+    desktop=os.environ.get('NEUROOS_DESKTOP')=='1'
     variant = f'fault-{fault}' if fault else 'test' if test else 'normal'
     if not fs3:variant+='-fs2'
     if fs3_test:variant+='-fs3-test'
+    if bootstrap_sdk:variant+='-bootstrap'
+    if desktop:variant+='-desktop'
     target = ROOT / 'build' / variant
     esp = target / 'esp'
     (esp / 'EFI' / 'BOOT').mkdir(parents=True, exist_ok=True)
@@ -63,11 +71,13 @@ def build(test=False, fault=0):
         flags.append('-DNEUROOS_BOOT_TEST=1')
     flags.append(f'-DNEUROOS_FAULT_TEST={fault}')
     flags.append(f'-DNEUROOS_FS3_TEST={int(fs3_test)}')
+    flags.append(f'-DNEUROOS_BOOTSTRAP_SDK={int(bootstrap_sdk)}')
+    flags.append(f'-DNEUROOS_DESKTOP={int(desktop)}')
     elf = esp / 'boot' / 'kernel.elf'
     objects = []
     for source in ['main.c', 'memory.c', 'exceptions.c', 'entry.S', 'runtime.c',
                    'alloc.c', 'paging.c', 'devices.c', 'timer.S', 'shell.c',
-                   'process.c', 'user_program.S','elf.c','files.c','editor.c','fpu.c','sdk.c']:
+                   'process.c', 'user_program.S','elf.c','files.c','editor.c','fpu.c','sdk.c','display.c']:
         obj = target / (Path(source).stem + '.o')
         subprocess.run([clang, *flags, '-c', 'kernel/' + source, '-o', str(obj)],
                        cwd=ROOT, check=True)
@@ -77,7 +87,7 @@ def build(test=False, fault=0):
                     *objects, '-o', str(elf)], cwd=ROOT, check=True)
     user_flags=[f for f in flags if not f.startswith('-mcmodel=') and f!='-mgeneral-regs-only']
     user_flags+=['-mcmodel=small','-mno-avx','-fno-builtin','-Iuser']
-    apps=['ramfs','fsclient','filedemo','libcdemo','floatdemo']+(['fs3demo'] if fs3_test else [])
+    apps=['ramfs','fsclient','filedemo','libcdemo','floatdemo','desktop']+(['fs3demo'] if fs3_test else [])
     for app in apps:
         installable=app in ('filedemo','libcdemo','floatdemo','fs3demo')
         app_objects=[]
@@ -86,6 +96,7 @@ def build(test=False, fault=0):
         if app=='ramfs' and fs3:
             sources.remove('user/ramfs.c');sources+=['user/ramfs3.c','user/fs3.c']
         if installable:sources+=['user/file.c','user/heap.c','user/stdio.c']
+        if app=='desktop':sources+=['user/file.c','user/heap.c','user/format.c','user/string.c','user/stdio.c']
         if app=='filedemo':sources+=['tests/user_io.c']
         if app=='libcdemo':sources+=['user/format.c','user/string.c','user/setjmp.S','user/stdlib.c',
                                     'tests/user_libc.c','tests/user_jmp.S']
@@ -157,6 +168,9 @@ def build(test=False, fault=0):
             config.write('    module_path: boot():/boot/fs3demo.nos\n')
     manifest = {
         'variant': variant,
+        'filesystem_backend':backend,
+        'bootstrap_sdk':bootstrap_sdk,
+        'desktop':desktop,
         'clang': subprocess.check_output([clang, '--version'], text=True).splitlines()[0],
         'linker': subprocess.check_output([linker, '--version'], text=True).strip(),
         'kernel_sha256': hashlib.sha256(elf.read_bytes()).hexdigest(),

@@ -1,0 +1,4 @@
+#ifndef NEUROOS_VERSION_H
+#define NEUROOS_VERSION_H
+#define NEUROOS_VERSION "0.0.15"
+#endif

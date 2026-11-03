@@ -21,6 +21,10 @@ int user_main(void) {
     long device = call3(9, 3, 0x1f7, 0);
     bool persistent = device >= 0 && device != 0 && device != 255, transaction = false;
     if (persistent) {
+        if (!storage_reset()) {
+            say("ATA RESET FAILED\n");
+            return 4;
+        }
         struct fs3_io io = {.read = read_sector, .write = write_sector, .flush = flush_disk};
         int mounted = fs3_mount(&volume, &io);
         if (mounted < 0) {
@@ -49,9 +53,12 @@ int user_main(void) {
             yield();
             continue;
         }
-        if (n != sizeof(q))
+        if (n < 0)
             return 1;
-        if (q.op == 9)
+        bool complete = n == sizeof(q);
+        if (!complete)
+            r = (struct fs_message){.status = -22};
+        else if (q.op == 9)
             r = (struct fs_message){.op = 9, .size = persistent ? 1 : 0};
         else if (persistent) {
             if (q.op == FS_QUIT)
@@ -83,7 +90,7 @@ int user_main(void) {
             return 2;
         if (persistent && volume.poisoned)
             return 4;
-        if (q.op == FS_QUIT && !r.status)
+        if (complete && q.op == FS_QUIT && !r.status)
             return 0;
     }
 }
