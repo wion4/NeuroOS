@@ -20,6 +20,20 @@ static inline long receive_message(unsigned cap, void *message, size_t bytes) {
 static inline long receive_wait(unsigned cap, void *message, size_t bytes) {
     return call3(16, cap, (uintptr_t)message, bytes);
 }
+#ifdef NEUROOS_HOST_ABI
+long receive_wait_from(unsigned cap, void *message, size_t bytes, uint64_t *sender);
+#else
+static inline long receive_wait_from(unsigned cap, void *message, size_t bytes, uint64_t *sender) {
+    uint64_t call = 16, source = bytes;
+    __asm__ volatile("int $0x80"
+                     : "+a"(call), "+d"(source)
+                     : "D"((uint64_t)cap), "S"((uintptr_t)message)
+                     : "memory", "cc");
+    if ((long)call >= 0 && sender)
+        *sender = source;
+    return (long)call;
+}
+#endif
 static inline void say(const char *s) {
     size_t n = 0;
     while (s[n])

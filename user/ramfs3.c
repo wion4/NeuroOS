@@ -48,7 +48,8 @@ int user_main(void) {
         say("RAMFS SERVICE READY\n");
     for (;;) {
         struct fs_message q, r;
-        long n = receive_wait(1, &q, sizeof(q));
+        uint64_t sender;
+        long n = receive_wait_from(1, &q, sizeof(q), &sender);
         if (n == -11) {
             yield();
             continue;
@@ -64,7 +65,7 @@ int user_main(void) {
             if (q.op == FS_QUIT)
                 r = (struct fs_message){.op = FS_QUIT, .status = -1};
             else
-                fs3_handle(&volume, &q, &r);
+                fs3_handle_client(&volume, sender, &q, &r);
         } else if (q.op == FS_BEGIN) {
             r = (struct fs_message){.op = FS_BEGIN, .status = transaction ? -16 : 0};
             if (!transaction) {

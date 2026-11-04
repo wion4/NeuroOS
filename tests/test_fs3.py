@@ -65,10 +65,15 @@ class FS3Tests(unittest.TestCase):
                             '-c',source,'-o',str(obj)],cwd=ROOT,check=True);objects.append(str(obj))
         subprocess.run([linker,'/dll','/noentry','/nodefaultlib',*objects,
                         '/export:fs3_mount','/export:fs3_handle','/export:fs3_sizeof','/export:fs3_import_legacy',
+                        '/export:fs3_handle_client','/export:fs3_client_closed',
                         '/out:'+str(target/'fs3.dll')],check=True)
         cls.lib=c.CDLL(str(target/'fs3.dll'));cls.lib.fs3_sizeof.restype=c.c_size_t
         cls.lib.fs3_mount.argtypes=[c.c_void_p,c.POINTER(IO)];cls.lib.fs3_mount.restype=c.c_int
         cls.lib.fs3_handle.argtypes=[c.c_void_p,c.POINTER(Message),c.POINTER(Message)]
+        cls.lib.fs3_handle_client.argtypes=[c.c_void_p,c.c_uint64,c.POINTER(Message),c.POINTER(Message)]
+        cls.lib.fs3_handle_client.restype=None
+        cls.lib.fs3_client_closed.argtypes=[c.c_void_p,c.c_uint64]
+        cls.lib.fs3_client_closed.restype=c.c_bool
         cls.lib.fs3_import_legacy.argtypes=[c.c_void_p,c.c_void_p,c.c_size_t]
         cls.lib.fs3_import_legacy.restype=c.c_int
     def mount(self,disk):
@@ -76,11 +81,14 @@ class FS3Tests(unittest.TestCase):
         return self.lib.fs3_mount(volume,c.byref(disk.io)),volume
     def setUp(self):
         self.disk=Disk();result,self.volume=self.mount(self.disk);self.assertEqual(result,0)
-    def request(self,op,name='file',offset=0,data=b'',size=None,volume=None):
+    def request(self,op,name='file',offset=0,data=b'',size=None,volume=None,client=None):
         if size is None:size=len(data)
         q=Message(op=op,name=name.encode(),offset=offset,size=size);r=Message()
         if data:c.memmove(c.addressof(q)+Message.data.offset,data,len(data))
-        self.lib.fs3_handle(volume if volume is not None else self.volume,c.byref(q),c.byref(r));return r
+        target=volume if volume is not None else self.volume
+        if client is None:self.lib.fs3_handle(target,c.byref(q),c.byref(r))
+        else:self.lib.fs3_handle_client(target,client,c.byref(q),c.byref(r))
+        return r
     def read(self,name='file',offset=0,size=32,volume=None):
         r=self.request(3,name,offset,size=size,volume=volume)
         self.assertEqual(r.status,0);return c.string_at(c.addressof(r)+Message.data.offset,r.size)
@@ -104,6 +112,59 @@ class FS3Tests(unittest.TestCase):
         self.assertEqual(self.request(12).status,0)
         self.assertEqual(self.read(),b'original')
         self.assertEqual(self.request(12).status,-22)
+    def test_transaction_client_cannot_read_or_control_another_draft(self):
+        self.replace(b'original')
+        owner,other=0x100000007,0x200000009
+        self.assertEqual(self.request(10,client=owner).status,0)
+        self.assertEqual(self.request(2,data=b'private!',client=owner).status,0)
+        before=(self.disk.writes,self.disk.flushes,dict(self.disk.sectors))
+        for op in range(1,13):
+            self.assertEqual(self.request(op,client=other).status,-16,op)
+        self.assertEqual(self.request(3).status,-16) # Legacy caller cannot bypass ownership.
+        self.assertEqual((self.disk.writes,self.disk.flushes,self.disk.sectors),before)
+        own=self.request(3,size=32,client=owner)
+        self.assertEqual(own.status,0);self.assertEqual(bytes(own.data[:own.size]),b'private!')
+        self.assertEqual(self.request(11,client=owner).status,0)
+        committed=self.request(3,size=32,client=other)
+        self.assertEqual(committed.status,0);self.assertEqual(bytes(committed.data[:committed.size]),b'private!')
+    def test_client_death_rolls_back_only_its_transaction_without_io(self):
+        self.replace(b'committed')
+        self.assertEqual(self.request(10,client=41).status,0)
+        self.assertEqual(self.request(2,data=b'pending!!',client=41).status,0)
+        before=(self.disk.writes,self.disk.flushes,dict(self.disk.sectors))
+        self.assertFalse(self.lib.fs3_client_closed(self.volume,42))
+        self.assertTrue(self.lib.fs3_client_closed(self.volume,41))
+        self.assertFalse(self.lib.fs3_client_closed(self.volume,41))
+        self.assertEqual((self.disk.writes,self.disk.flushes,self.disk.sectors),before)
+        self.assertEqual(self.read(),b'committed')
+        status,cold=self.mount(self.disk);self.assertEqual(status,1)
+        self.assertEqual(self.read(volume=cold),b'committed')
+    def test_stale_client_identity_cannot_abort_reused_slot(self):
+        self.replace(b'old')
+        old,new=0x100000001,0x200000001
+        self.assertEqual(self.request(10,client=old).status,0)
+        self.assertTrue(self.lib.fs3_client_closed(self.volume,old))
+        self.assertEqual(self.request(10,client=new).status,0)
+        self.assertEqual(self.request(2,data=b'new',client=new).status,0)
+        self.assertFalse(self.lib.fs3_client_closed(self.volume,old))
+        self.assertEqual(self.request(12,client=old).status,-16)
+        self.assertEqual(self.request(11,client=old).status,-16)
+        self.assertEqual(self.request(11,client=new).status,0)
+        self.assertEqual(self.read(),b'new')
+        self.assertEqual(self.request(1,name='auto-a',client=old).status,0)
+        self.assertEqual(self.request(1,name='auto-b',client=new).status,0)
+    def test_client_cleanup_does_not_unpoison_failed_commit(self):
+        self.replace(b'original')
+        self.assertEqual(self.request(10,client=7).status,0)
+        self.assertEqual(self.request(2,data=b'not safe',client=7).status,0)
+        self.disk.fail_write=self.disk.writes+1
+        self.assertEqual(self.request(11,client=7).status,-5)
+        before=(self.disk.writes,self.disk.flushes)
+        self.assertTrue(self.lib.fs3_client_closed(self.volume,7))
+        self.assertEqual(self.request(1,name='forbidden',client=8).status,-5)
+        self.assertEqual((self.disk.writes,self.disk.flushes),before)
+        self.disk.crash();status,cold=self.mount(self.disk);self.assertEqual(status,1)
+        self.assertEqual(self.read(volume=cold),b'original')
     def test_holes_cross_blocks_and_truncate(self):
         self.replace(b'head')
         self.assertEqual(self.request(10).status,0)

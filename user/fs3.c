@@ -276,12 +276,14 @@ static int begin(struct fs3 *f) {
         blank_root(f->draft);
     zero(f->dirty, sizeof(f->dirty));
     f->transaction = true;
+    f->transaction_client = 0;
     return 0;
 }
 static void abort_transaction(struct fs3 *f) {
     f->cache_dirty = false;
     f->cache_block = UINT32_MAX;
     f->transaction = false;
+    f->transaction_client = 0;
     if (f->active >= 0)
         copy(f->draft, f->roots[f->active], FS3_ROOT_BYTES);
     else
@@ -325,6 +327,7 @@ static int commit(struct fs3 *f) {
         if (f->dirty[i])
             f->verified[i] = true;
     f->transaction = false;
+    f->transaction_client = 0;
     return 0;
 }
 static void discard_file_cache(struct fs3 *f, const uint8_t *r) {
@@ -439,7 +442,7 @@ static int operation(struct fs3 *f, const struct fs_message *q, struct fs_messag
     }
     return -22;
 }
-void fs3_handle(struct fs3 *f, const struct fs_message *q, struct fs_message *out) {
+static void handle(struct fs3 *f, const struct fs_message *q, struct fs_message *out) {
     *out = (struct fs_message){.op = q->op, .status = -22};
     if (f->poisoned) {
         out->status = -5;
@@ -482,6 +485,24 @@ void fs3_handle(struct fs3 *f, const struct fs_message *q, struct fs_message *ou
                 abort_transaction(f);
         }
     }
+}
+void fs3_handle_client(struct fs3 *f, uint64_t client, const struct fs_message *q,
+                       struct fs_message *out) {
+    if (f->transaction && f->transaction_client != client) {
+        *out = (struct fs_message){.op = q->op, .status = f->poisoned ? -5 : -16};
+        return;
+    }
+    handle(f, q, out);
+    f->transaction_client = f->transaction ? client : 0;
+}
+void fs3_handle(struct fs3 *f, const struct fs_message *q, struct fs_message *out) {
+    fs3_handle_client(f, 0, q, out);
+}
+bool fs3_client_closed(struct fs3 *f, uint64_t client) {
+    if (!f->transaction || f->transaction_client != client)
+        return false;
+    abort_transaction(f);
+    return true;
 }
 int fs3_import_legacy(struct fs3 *f, const uint8_t *payload, size_t bytes) {
     if (f->poisoned)
