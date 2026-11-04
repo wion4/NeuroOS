@@ -7,6 +7,7 @@
 #include "exceptions.h"
 #include "fpu.h"
 #include "io.h"
+#include "journal.h"
 #include "paging.h"
 #include "shell.h"
 #include <stddef.h>
@@ -55,6 +56,7 @@ static uint64_t next_identity = 1;
 static struct native_job_state {
     struct native_job_info info;
     bool files, close_sent, close_acked;
+    uint64_t owner, peak_pages, cpu_ticks;
 } native_job;
 static long native_control(struct task *, uint64_t op, uint64_t address, uint64_t bytes);
 static void advance_native_job(void);
@@ -109,6 +111,26 @@ static bool task_alive(const struct task *task) {
 }
 static bool file_server_task(const struct task *task) {
     return task->caps[3].endpoint == 2 && task->caps[3].rights == 4;
+}
+static void measure_native_job(void) {
+    if (native_job.info.state == NOS_JOB_RUNNING && tasks[4].space.root) {
+        uint64_t pages = tasks[4].space.count + tasks[4].space.heap_pages;
+        if (pages > native_job.peak_pages)
+            native_job.peak_pages = pages;
+        native_job.cpu_ticks = tasks[4].ticks;
+    }
+}
+static void journal_job(unsigned kind, uint64_t value) {
+    measure_native_job();
+    struct nos_event event = {.ticks = timer_ticks(),
+                              .job = native_job.info.id,
+                              .owner = native_job.owner,
+                              .kind = kind,
+                              .flags = native_job.files ? NOS_EVENT_FILES : 0,
+                              .value = value,
+                              .cpu_ticks = native_job.cpu_ticks,
+                              .pages = native_job.peak_pages};
+    journal_append(&event);
 }
 static uint64_t allocate_identity(void) {
     if (next_identity >= 0x7fffffffffffffffull)
@@ -237,13 +259,14 @@ static void syscall(struct task *task) {
                     break;
                 }
                 if (task->reply_control) {
-                    if (reply.op != FS_CLIENT_CLOSED || reply.status ||
+                    if (reply.op != FS_CLIENT_CLOSED || reply.status || reply.size > 1 ||
                         task->reply_session != native_job.info.id) {
                         f->rax = (uint64_t)-22;
                         break;
                     }
                     native_job.close_acked = true;
                     task->reply_control = false;
+                    journal_job(NOS_EVENT_FS_CLOSED, reply.size);
                 }
                 task->ipc_idle = true;
                 break; /* Kernel notification ack or a dead client's obsolete reply. */
@@ -359,6 +382,8 @@ static void syscall(struct task *task) {
             f->rax = (uint64_t)-12;
         else
             f->rax = USER_HEAP + (uint64_t)task->space.heap_pages * 4096;
+        if (current == 4)
+            measure_native_job();
         break;
     case 11: {
         if (!task->desktop) {
@@ -485,6 +510,27 @@ static void syscall(struct task *task) {
     case 20:
         f->rax = (uint64_t)native_control(task, f->rdi, f->rsi, f->rdx);
         break;
+    case 21: {
+        if (!task->desktop || current != 1) {
+            f->rax = (uint64_t)-1;
+            break;
+        }
+        struct nos_event_query query;
+        if (f->rsi != sizeof(query) || f->rdx) {
+            f->rax = (uint64_t)-22;
+            break;
+        }
+        if (!user_check_write(&task->space, f->rdi, sizeof(query)) ||
+            !user_copy_from(&task->space, &query, f->rdi, sizeof(query))) {
+            f->rax = (uint64_t)-14;
+            break;
+        }
+        int error = journal_read(&query);
+        f->rax = error                                                       ? (uint64_t)error
+                 : user_copy_to(&task->space, f->rdi, &query, sizeof(query)) ? 0
+                                                                             : (uint64_t)-14;
+        break;
+    }
     case 17: {
         if (f->rdi != 3 || task->caps[3].endpoint != 3 || task->caps[3].rights != 16 || !ai_model) {
             f->rax = (uint64_t)-1;
@@ -594,6 +640,11 @@ static void advance_native_job(void) {
                                                 : NOS_LAUNCH_FAULTED;
         r->exit_code = tasks[4].status;
         r->fault = (uint32_t)tasks[4].fault;
+        journal_job(r->kind == NOS_LAUNCH_EXITED      ? NOS_EVENT_EXITED
+                    : r->kind == NOS_LAUNCH_TIMED_OUT ? NOS_EVENT_TIMED_OUT
+                    : r->kind == NOS_LAUNCH_CANCELLED ? NOS_EVENT_CANCELLED
+                                                      : NOS_EVENT_FAULTED,
+                    r->kind == NOS_LAUNCH_EXITED ? r->exit_code : r->fault);
         if (r->kind == NOS_LAUNCH_EXITED) {
             console_write("EXIT CODE ");
             console_number(r->exit_code);
@@ -636,6 +687,7 @@ static void advance_native_job(void) {
 static void discard_native_job(void) {
     if (native_job.info.state == NOS_JOB_EMPTY)
         return;
+    journal_job(NOS_EVENT_OWNER_CLOSED, native_job.info.state);
     if (native_job.info.state != NOS_JOB_FINISHED) {
         purge_native_requests();
         user_space_destroy(&tasks[4].space);
@@ -677,6 +729,8 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
         native_job.info = (struct native_job_info){
             .id = id, .state = NOS_JOB_RUNNING, .result = {.kind = NOS_LAUNCH_LOAD_ERROR}};
         native_job.files = (launch_request.flags & NOS_LAUNCH_FILES) != 0;
+        native_job.owner = desktop->fs_session;
+        journal_job(NOS_EVENT_REQUESTED, 0);
         launch_pending = pending_native_start = true;
         pending_ai = pending_native_recovery = false;
         desktop->state = SUSPENDED;
@@ -711,10 +765,12 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
         if (op == NOS_JOB_CANCEL) {
             if (native_job.info.state != NOS_JOB_RUNNING || !task_alive(&tasks[4]))
                 return -16;
+            journal_job(NOS_EVENT_CANCEL_REQUESTED, 0);
             tasks[4].state = CANCELLED;
         } else {
             if (native_job.info.state != NOS_JOB_FINISHED)
                 return -16;
+            journal_job(NOS_EVENT_REAPED, native_job.info.result.kind);
             native_job = (struct native_job_state){0};
         }
         return 0;
@@ -725,8 +781,13 @@ static void start_native_job(void) {
     const void *file;
     uint64_t size, entry;
     tasks[4] = (struct task){0};
-    if (!filesystem_load(launch_request.name, &file, &size) ||
-        !user_space_elf(&tasks[4].space, file, size, &entry)) {
+    if (!filesystem_load(launch_request.name, &file, &size)) {
+        journal_job(NOS_EVENT_LOAD_FAILED, (uint64_t)-5);
+        finish_native_job();
+        return;
+    }
+    if (!user_space_elf(&tasks[4].space, file, size, &entry)) {
+        journal_job(NOS_EVENT_LOAD_FAILED, (uint64_t)-8);
         finish_native_job();
         return;
     }
@@ -734,6 +795,7 @@ static void start_native_job(void) {
     while (launch_request.arguments[n])
         ++n;
     if (!user_copy_to(&tasks[4].space, USER_STACK + 0x100, launch_request.arguments, n + 1)) {
+        journal_job(NOS_EVENT_LOAD_FAILED, (uint64_t)-14);
         user_space_destroy(&tasks[4].space);
         finish_native_job();
         return;
@@ -750,6 +812,7 @@ static void start_native_job(void) {
         tasks[4].caps[1] = (struct capability){0, SEND};
         tasks[4].caps[2] = (struct capability){4, RECEIVE};
     }
+    journal_job(NOS_EVENT_STARTED, 0);
     console_write("NATIVE JOB STARTED\n");
 }
 struct cpu_context *process_trap(struct cpu_context *frame, uint64_t cr2) {
@@ -1115,6 +1178,7 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
             start_native_job();
         } else if (pending_native_recovery) {
             native_job.info.cleanup_error = -5;
+            journal_job(NOS_EVENT_FS_RECOVERING, 0);
             finish_native_job();
         } else if (pending_ai) {
             if (desktop_ai.request.op == AI_UNLOAD)
@@ -1170,6 +1234,9 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         if (pending_native_recovery) {
             if (tasks[0].space.root)
                 native_job.info.cleanup_error = 0;
+            journal_job(native_job.info.cleanup_error ? NOS_EVENT_FS_RECOVERY_FAILED
+                                                      : NOS_EVENT_FS_RECOVERED,
+                        (uint64_t)(int64_t)native_job.info.cleanup_error);
             tasks[1].context.rax = user_copy_to(&tasks[1].space, launch_destination,
                                                 &native_job.info, sizeof(native_job.info))
                                        ? 0

@@ -11,7 +11,7 @@ def seed_native_disk(disk, target):
     spin = bytearray(hello); spin[128:130] = b'\xeb\xfe'
     files = {'hello.nos': hello, 'spin.nos': bytes(spin),
              'filedemo.nos': (target / 'esp/boot/filedemo.nos').read_bytes(),
-             'sentinel.txt': b'seed'}
+             'sentinel.txt': b'seed', 'bogus.nos': b'not an ELF'}
     payload = bytearray(131264)
     for index, (name, data) in enumerate(files.items()):
         assert len(data) <= 16384

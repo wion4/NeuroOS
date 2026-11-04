@@ -4,6 +4,7 @@
 #include "display.h"
 #include "exceptions.h"
 #include "io.h"
+#include "journal.h"
 #include "limine.h"
 #include "memory.h"
 #include "paging.h"
@@ -538,6 +539,7 @@ __attribute__((noreturn)) void kmain(void) {
 #endif
     terminal_init(active_screen);
 #ifdef NEUROOS_BOOT_TEST
+    journal_reset();
     timer_init();
     if (!process_demo()) {
         serial_write("BOOT ERROR: process isolation test\n");
@@ -551,6 +553,7 @@ __attribute__((noreturn)) void kmain(void) {
 #else
     bool keyboard = keyboard_init();
     console_write(keyboard ? "KEYBOARD READY\n" : "KEYBOARD UNAVAILABLE - SERIAL INPUT ONLY\n");
+    journal_reset();
     timer_init();
     bool processes_ok = process_demo();
     bool services_ok = kernel_services();

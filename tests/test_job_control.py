@@ -40,6 +40,7 @@ try:
     desktop.write_bytes(data)
     with DesktopGuest(neuro, target, folder) as guest:
         guest.wait(b'JOB CONTROL TEST PASS', timeout=60)
+        guest.wait(b'JOB EVENT TEST PASS')
         guest.wait(b'DESKTOP EXIT CLEAN')
         guest.wait(b'SHELL READY')
         serial = guest.log.read_bytes()
@@ -54,5 +55,7 @@ report.write_text(json.dumps({'passed': True, 'checks': [
     'finished result survives invalid poll', 'ordinary process cannot forge kernel control',
     'private transaction, foreign commit/abort denied', 'cancel sleeping process and roll back draft',
     'two simultaneous FS clients with distinct replies', 'all fixture files byte-identical',
-    'kernel desktop resource check passes']}, indent=2) + '\n')
+    'kernel desktop resource check passes', 'read-only versioned event query',
+    'event order, owner and completion values', 'charged CPU ticks and peak heap pages',
+    'event journal overwrite detection and independent cursors']}, indent=2) + '\n')
 print('PASS: native job handles, cancel/reap, private FS sessions, live replies and complete cleanup')

@@ -106,6 +106,8 @@ static int heap_test(char mode) {
     return 0;
 }
 int user_main(const char *args) {
+    if (call3(21, 0, 0, 0) != -1)
+        return 77; /* No controller event-observer rights in ordinary children. */
     volatile double a = 1.5, b = 2.0;
     if (a * b != 3.0)
         return 5;

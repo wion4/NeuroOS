@@ -4,6 +4,7 @@
 #include "abi.h"
 #include "ai.h"
 #include "cyrillic.h"
+#include "events.h"
 #include "file.h"
 #include "font.h"
 #include "heap.h"
@@ -19,10 +20,10 @@
 #define INK 0xe5edf4u
 #define MUTED 0x93a6b8u
 #define EDGE 0x2c4052u
-enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, AI, APP_COUNT };
-static const char *titles[] = {"Welcome",    "Files",    "Notes",       "Calculator",
-                               "Appearance", "Programs", "AI text demo"};
-static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps", "AI"};
+enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, AI, EVENTS, APP_COUNT };
+static const char *titles[] = {"Welcome",    "Files",    "Notes",        "Calculator",
+                               "Appearance", "Programs", "AI text demo", "Task events"};
+static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps", "AI", "Events"};
 struct window {
     int x, y, w, h;
     bool open;
@@ -30,8 +31,8 @@ struct window {
 static struct window windows[APP_COUNT] = {{132, 78, 620, 420, true},   {130, 78, 620, 430, false},
                                            {150, 90, 600, 420, false},  {340, 85, 365, 425, false},
                                            {220, 110, 490, 365, false}, {140, 85, 620, 425, false},
-                                           {136, 85, 620, 430, false}};
-static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5, 6}, active;
+                                           {136, 85, 620, 430, false},  {150, 95, 610, 400, false}};
+static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7}, active;
 static uint32_t *pixels, accent = 0x51e1ae;
 static const uint32_t accents[] = {0x51e1ae, 0x6baeff, 0xc09aff, 0xffbf69};
 static unsigned theme;
@@ -71,6 +72,11 @@ static unsigned program_scroll;
 static struct desktop_launch_result program_result;
 static uint64_t program_job;
 static struct native_job_info program_status;
+static struct nos_event event_cache[NOS_EVENT_RETAINED];
+static struct nos_event_query event_query;
+static uint64_t event_cursor, event_lost;
+static unsigned event_count, event_head, event_offset;
+static bool event_error;
 static char ai_prompt[56] = "Once upon a time";
 static struct ai_session ai_result;
 static bool ai_has_result, ai_busy;
@@ -734,6 +740,140 @@ static void draw_programs(struct window *w) {
     button(x + 400, y + 326, 76, "Up", false);
     button(x + 486, y + 326, 76, "Down", false);
 }
+static void events_poll(void) {
+    if (!windows[EVENTS].open)
+        return;
+    uint32_t old_flags = event_query.flags;
+    event_query = (struct nos_event_query){
+        .version = NOS_EVENT_VERSION, .capacity = NOS_EVENT_BATCH, .after = event_cursor};
+    long e = call3(21, (uintptr_t)&event_query, sizeof(event_query), 0);
+    if (e < 0 || event_query.version != NOS_EVENT_VERSION || event_query.count > NOS_EVENT_BATCH ||
+        event_query.next < event_cursor) {
+        if (!event_error) {
+            say("DESKTOP EVENT OBSERVER ERROR\n");
+            redraw = true;
+        }
+        event_error = true;
+        return;
+    }
+    if (event_error || old_flags != event_query.flags)
+        redraw = true;
+    event_error = false;
+    for (unsigned i = 0; i < event_query.count; ++i) {
+        unsigned slot = (event_head + event_count) % NOS_EVENT_RETAINED;
+        if (event_count == NOS_EVENT_RETAINED) {
+            slot = event_head;
+            event_head = (event_head + 1) % NOS_EVENT_RETAINED;
+        } else
+            ++event_count;
+        event_cache[slot] = event_query.events[i];
+        if (event_offset)
+            ++event_offset;
+    }
+    event_cursor = event_query.next;
+    event_lost += event_query.lost;
+    if (event_query.lost)
+        say("DESKTOP EVENT RECORDS MISSED\n");
+    unsigned limit = event_count > 12 ? event_count - 12 : 0;
+    if (event_offset > limit)
+        event_offset = limit;
+    if (event_query.count || event_query.lost) {
+        redraw = true;
+        say("DESKTOP EVENTS UPDATED\n");
+    }
+}
+static void events_move(int delta) {
+    unsigned limit = event_count > 12 ? event_count - 12 : 0;
+    if (delta < 0)
+        event_offset = event_offset > (unsigned)-delta ? event_offset + delta : 0;
+    else
+        event_offset += (unsigned)delta;
+    if (event_offset > limit)
+        event_offset = limit;
+    redraw = true;
+}
+static const char *event_name(unsigned kind) {
+    static const char *names[] = {"Unknown",        "Requested",      "Started",     "Load failed",
+                                  "Stop requested", "Exited",         "Fault",       "CPU limit",
+                                  "Cancelled",      "Files closed",   "FS recovery", "FS recovered",
+                                  "FS unavailable", "Result cleared", "Owner closed"};
+    return kind < sizeof(names) / sizeof(names[0]) ? names[kind] : names[0];
+}
+static void event_number(int x, int y, uint64_t value, unsigned limit, bool signed_value) {
+    char value_text[24];
+    if (signed_value)
+        snprintf(value_text, sizeof(value_text), "%lld", (long long)value);
+    else
+        snprintf(value_text, sizeof(value_text), "%llu", (unsigned long long)value);
+    if (strlen(value_text) > limit) {
+        value_text[limit - 1] = '+';
+        value_text[limit] = 0;
+    }
+    text(x, y, value_text, 1, INK);
+}
+static void draw_events(struct window *w) {
+    int x = w->x + 20, y = w->y + 55;
+    text(x, y, "Seq", 1, MUTED);
+    text(x + 70, y, "Job", 1, MUTED);
+    text(x + 140, y, "Event", 1, MUTED);
+    text(x + 290, y, "Value", 1, MUTED);
+    text(x + 420, y, "Pages", 1, MUTED);
+    text(x + 480, y, "CPU", 1, MUTED);
+    rect(x, y + 24, w->w - 40, 222, BG);
+    for (unsigned row = 0; row < 12 && row + event_offset < event_count; ++row) {
+        unsigned index = (event_head + event_count - 1 - event_offset - row) % NOS_EVENT_RETAINED;
+        const struct nos_event *event = &event_cache[index];
+        int top = y + 34 + (int)row * 18;
+        event_number(x + 6, top, event->sequence, 10, false);
+        event_number(x + 70, top, event->job, 10, false);
+        char name[24];
+        snprintf(name, sizeof(name), "%s%s", event_name(event->kind),
+                 (event->kind == NOS_EVENT_REQUESTED || event->kind == NOS_EVENT_STARTED) &&
+                         (event->flags & NOS_LAUNCH_FILES)
+                     ? " +files"
+                     : "");
+        text(x + 140, top, name, 1, INK);
+        event_number(x + 290, top, event->value, 20,
+                     event->kind == NOS_EVENT_LOAD_FAILED ||
+                         event->kind == NOS_EVENT_FS_RECOVERY_FAILED);
+        event_number(x + 420, top, event->pages, 6, false);
+        event_number(x + 480, top, event->cpu_ticks, 12, false);
+    }
+    if (!event_count)
+        text(x + 12, y + 40, "No task events yet.", 1, MUTED);
+    char status[96];
+    snprintf(status, sizeof(status), "Retained %u / missed %llu / newest first", event_count,
+             (unsigned long long)event_lost);
+    text(x, w->y + w->h - 84, event_error ? "Event observer unavailable." : status, 1, MUTED);
+    text(x, w->y + w->h - 66,
+         event_query.flags & NOS_EVENT_EXHAUSTED
+             ? "Sequence exhausted. Older records remain readable."
+             : "Pages: peak owned / CPU: charged ticks / FS closed value 1: rollback",
+         1, MUTED);
+    button(x, w->y + w->h - 40, 94, "Latest", false);
+    button(x + 400, w->y + w->h - 40, 76, "Up", false);
+    button(x + 486, w->y + w->h - 40, 76, "Down", false);
+}
+static void events_key(uint32_t key) {
+    if (key == KEY_UP)
+        events_move(-1);
+    else if (key == KEY_DOWN)
+        events_move(1);
+    else if (key == KEY_PAGEUP)
+        events_move(-12);
+    else if (key == KEY_PAGEDOWN)
+        events_move(12);
+    else if (key == KEY_HOME) {
+        event_offset = 0;
+        redraw = true;
+    } else if (key == KEY_END) {
+        event_offset = event_count;
+        events_move(0);
+    } else if (key == 27) {
+        windows[EVENTS].open = false;
+        front(PROGRAMS);
+    }
+}
 static void ai_action(bool unload) {
     struct ai_request request = {.op = unload ? AI_UNLOAD : AI_GENERATE, .steps = 48};
     snprintf(request.prompt, sizeof(request.prompt), "%s", ai_prompt);
@@ -1033,6 +1173,8 @@ static void paint(void) {
         text(w->x + 15, w->y + 14, titles[id], 1, INK);
         if (id == NOTES)
             button(w->x + w->w - 76, w->y + 4, 30, note_maximized ? "-" : "+", false);
+        if (id == PROGRAMS)
+            button(w->x + w->w - 140, w->y + 4, 95, "Events", false);
         button(w->x + w->w - 38, w->y + 4, 30, "x", false);
         if (id == HOME)
             draw_home(w);
@@ -1048,6 +1190,8 @@ static void paint(void) {
             draw_programs(w);
         if (id == AI)
             draw_ai(w);
+        if (id == EVENTS)
+            draw_events(w);
     }
     rect(0, 533, W, 67, 0x111e2b);
     line(0, 533, W, EDGE);
@@ -1136,6 +1280,10 @@ static void click(void) {
                 note_maximized = true;
             }
             redraw = true;
+            return;
+        }
+        if (id == PROGRAMS && inside(w->x + w->w - 140, w->y + 4, 95, 28)) {
+            front(EVENTS);
             return;
         }
         if (input.y < w->y + 35) {
@@ -1227,6 +1375,14 @@ static void click(void) {
                 if (program_scroll > limit)
                     program_scroll = limit;
             }
+        } else if (id == EVENTS) {
+            if (inside(x, w->y + w->h - 40, 94, 28)) {
+                event_offset = 0;
+                redraw = true;
+            } else if (inside(x + 400, w->y + w->h - 40, 76, 28))
+                events_move(-12);
+            else if (inside(x + 486, w->y + w->h - 40, 76, 28))
+                events_move(12);
         } else if (id == CALC) {
             for (int j = 0; j < 16; ++j)
                 if (inside(w->x + 22 + (j % 4) * 80, w->y + 152 + (j / 4) * 49, 68, 38))
@@ -1283,6 +1439,7 @@ int user_main(void) {
     struct desktop_input old = {.x = -1, .y = -1};
     while (!exiting) {
         program_poll();
+        events_poll();
         ai_poll();
         if (call3(11, 0, (uintptr_t)&input, 0) < 0) {
             free(pixels);
@@ -1339,6 +1496,8 @@ int user_main(void) {
                 redraw = true;
             } else if (windows[active].open && active == NOTES)
                 note_key(key);
+            else if (windows[active].open && active == EVENTS)
+                events_key(key);
             else if (windows[active].open && active == AI)
                 ai_key(key);
             else if (windows[active].open && active == PROGRAMS)

@@ -85,7 +85,8 @@ def build(test=False, fault=0):
     objects = []
     for source in ['main.c', 'memory.c', 'exceptions.c', 'entry.S', 'runtime.c',
                    'alloc.c', 'paging.c', 'devices.c', 'timer.S', 'shell.c',
-                   'process.c', 'user_program.S','elf.c','files.c','editor.c','fpu.c','sdk.c','display.c']:
+                   'process.c', 'user_program.S','elf.c','files.c','editor.c','fpu.c','sdk.c','display.c',
+                   'journal.c']:
         obj = target / (Path(source).stem + '.o')
         subprocess.run([clang, *flags, '-c', 'kernel/' + source, '-o', str(obj)],
                        cwd=ROOT, check=True)

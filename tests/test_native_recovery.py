@@ -92,6 +92,9 @@ with DesktopGuest(neuro, target, folder) as guest:
     recovered = guest.wait(b'DESKTOP PROGRAM RESULT', start)
     assert b'FILESYSTEM SERVICE RECOVERED' in recovered
     guest.screenshot('contained-filesystem-fault')
+    begin = guest.log.stat().st_size
+    guest.click(665, 103); guest.wait(b'DESKTOP EVENTS UPDATED', begin); time.sleep(.3)
+    guest.screenshot('filesystem-recovery-events'); guest.key('esc')
     # Fresh job, not replay of the failed write, uses a new session after recovery.
     guest.click(255, 148)
     for _ in range(15): guest.key('backspace')

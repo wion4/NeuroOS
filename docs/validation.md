@@ -1,5 +1,42 @@
 # Проверки NeuroOS
 
+## 2026-11-04 — v0.0.20: журнал native jobs и GUI observer
+
+Полный check-release --desktop из 21 этапа — PASS без AI. Включает host C
+проверки, загрузку/сервисы/SDK/libc, UTF-8 и GUI, фоновые программы, настоящий
+PIO fault файлового сервиса и новый Events. Рабочий диск VMware в тестах не
+использован. Отчёт: build/release-validation/result.json.
+
+test_journal.py компилирует настоящий kernel/journal.c: 7 проверок размера ABI,
+метаданных, независимости читателей, overwrite/lost, неверных cursor/version/
+capacity без изменения ответа, нулевых неиспользованных slots и исчерпания
+UINT64_MAX без wraparound. Никаких IO/аллокаций в kernel journal.
+
+test_job_control.py выполняет настоящее ring-3 управление и чтение событий:
+полномочия, неверный/readonly буфер, версия/размер/reserved, future cursor,
+owner/job/sequence, выход 42, неверный ELF (-8), отмена с ненулевым CPU,
+rollback draft=1, peak heap pages >400, fault vector 14 и естественный CPU
+limit ровно 1000. Двадцать последующих jobs переполняют журнал и проверяют
+lost/oldest; все данные fixture прежние, DESKTOP EXIT CLEAN.
+
+test_event_desktop.py вводит реальные QMP/PS2 события: наблюдение CPU-loop и
+busy FS без отмены задачи, Stop/rollback, 18 jobs при закрытом observer и явный
+missed, независимое сохранение заметки, повторный запуск desktop с прежней
+историей, закрытие владельца активной задачи. PMM соответствует baseline.
+test_native_recovery.py показывает в Events FS recovery/recovered после
+настоящего mid-PIO #PF; неподтверждённая запись не переиграна. Скриншоты —
+build/event-desktop и build/native-recovery. Границы API — [events.md](events.md).
+
+Также прошёл тот же ring-3 job/event controller с legacy FS2. Рабочий ISO
+0.0.20 (4,087,808 байт, без AI) загружен в VMware: STARTUP SELFTEST PASS, FS3,
+SDK, MOUSE READY, DESKTOP READY. Восемь user ELF LOAD payloads, process.o и
+journal.o побайтово совпали с проверенными; boot compiler.nos также совпал
+с обычной сборкой. Все 25 файлов и весь data-flat.vmdk равны SHA-проверенной
+копии before-0.0.20-20261104-130711. Интерактивные тесты выполнены в QEMU,
+в VMware проверены загрузка тех же payloads и сохранность диска. Отчёт:
+build/vmware-0.0.20-validation.json. SHA-256 ISO:
+101f49f86c1fa7ec2450087324512e6610792808270b3c328a150526b10f8c0d.
+
 ## 2026-11-04 — v0.0.19: фоновые .nos и логические IPC/FS-сессии
 
 Полный check-release --desktop из 18 этапов — PASS без AI. После него добавлен

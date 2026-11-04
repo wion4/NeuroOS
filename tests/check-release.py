@@ -16,13 +16,14 @@ def main():
     with disk.open('wb') as stream:stream.truncate(64*1024*1024)
     env=dict(os.environ,NEUROOS_DATA_DISK=str(disk))
     commands=[['tests/test_services.py'],['tests/test_format.py'],['tests/test_stdlib.py'],
-              ['tests/test_storage.py'],['tests/test_fs3.py'],['scripts/neuro.py','test','--memory','128']]
+              ['tests/test_storage.py'],['tests/test_fs3.py'],['tests/test_journal.py'],
+              ['scripts/neuro.py','test','--memory','128']]
     commands += [['tests/test_shell.py',*mode] for mode in
                  ([],['--file-sdk'],['--user-heap'],['--stdio'],['--descriptors'],['--libc'],['--floats'])]
     if '--desktop' in sys.argv:
         commands += [['tests/test_text.py'],['tests/test_desktop.py'],['tests/test_desktop_workflow.py'],
                      ['tests/test_job_control.py'],['tests/test_native_background.py'],
-                     ['tests/test_native_recovery.py']]
+                     ['tests/test_native_recovery.py'],['tests/test_event_desktop.py']]
     if '--ai' in sys.argv:
         commands += [['tests/test_ai_guest.py'],['tests/test_ai_desktop.py'],['tests/test_ai_background.py'],
                      ['tests/test_build_variants.py']]

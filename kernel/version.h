@@ -1,4 +1,4 @@
 #ifndef NEUROOS_VERSION_H
 #define NEUROOS_VERSION_H
-#define NEUROOS_VERSION "0.0.19"
+#define NEUROOS_VERSION "0.0.20"
 #endif

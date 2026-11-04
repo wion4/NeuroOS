@@ -15,7 +15,26 @@ Goal активен; завершение отдельного теста/рел
 ident[8]=1. Прототип AI v0.0.17–18 сохранён optional и заморожен; не развивать
 модели/чат/inference до готовности основания. Требования — system-control.md.
 
-## Проверенный результат
+## Текущий checkpoint — v0.0.20
+
+Модель не используется. Programs → Events: числовой lifecycle native jobs,
+owner/job/sequence/ticks, результат, наблюдённые peak pages/CPU ticks. Kernel
+RAM-кольцо на 64 записи, syscall 21 только trusted controller, независимые
+cursor/lost, overflow без wraparound; никаких указателей/текста/IO в журнале.
+История переживает перезапуск desktop, не reboot. Полный постоянный аудит,
+boot ID и scoped grants ещё не реализованы. См. events.md.
+
+Полный check-release --desktop: PASS всех 21 этапов без AI. Дополнительно PASS
+job_control с FS2. Реальный ring3 проверил права/буферы/версию/cursor, exit42,
+load error -8, cancel CPU, rollback1, heap peak >400, fault14, CPU limit1000
+и wrap кольца. GUI проверил наблюдение при busyFS/CPU, Stop, missed, restart
+controller, owner exit, точные файлы и PMM; FS recovery видна после mid-PIO #PF.
+Host journal проверен у UINT64_MAX. Рабочий ISO 0.0.20 4,087,808 байт загружен
+в VMware без AI. Все 25 файлов и весь flat disk прежние; 8 user LOAD payloads,
+process.o/journal.o совпали с тестовыми. Backup — work/backups/
+before-0.0.20-20261104-130711; локальные manifest/result — build/vmware-0.0.20-*.json.
+
+## Основа, реализованная в v0.0.19
 
 v0.0.19 — обычная фоновая .nos, без AI в рабочем образе. GUI сохраняет заметки
 во время CPU-bound задачи. Programs: Run/Stop, аргументы, вывод до 2047 байт,
@@ -67,20 +86,25 @@ GDB stub своего QEMU; GUI/данные сохранены, write не по
 build/vmware-0.0.19-backup.json. Backup в work/backups/before-0.0.19-20261104-115750
 от workspace new-chat. Предыдущий ISO 0.0.18 сохранён вместе с копией диска.
 
-## Следующий ограниченный шаг
+## Следующий ограниченный шаг — неблокирующая загрузка .nos
 
-Структурированный bounded журнал lifecycle задач: sequence, monotonic ticks,
-job/actor ID, тип события, итог/ресурсные счётчики; версия формата и обнаружение
-переполнения. Начать с read-only observer для доверенного controller, проверить
-обычным C-клиентом без модели. Не писать файлы/журнал синхронно из kernel trap.
-Сначала ring buffer с явной потерей старых записей, затем пользовательский
-collector/просмотр и разграничение подписок. Не выдавать обычной .nos права
-controller/ATA/display и не хранить указатели пользователя между вызовами.
+Сейчас START сохраняет desktop и синхронно читает ELF через kernel broker,
+создающий fsclient на каждый 32-байтовый RPC. Runtime уже фоновый, loading — нет.
+Выделить пользовательский loader с отдельной FS-сессией/ответом, чтением файла
+в его bounded память и передачей проверяемых bytes ядру. Не выдавать обычной
+.nos controller/display/ATA. Kernel ELF validation остаётся обязательной.
 
-После этого — неблокирующий пользовательский loader (нынешний kernel broker
-создаёт помощника на каждый 32-байтовый RPC), общий manager и несколько задач,
-объектные права/отзыв, большие файлы/каталоги/mappings и семантические API GUI.
-Все интерфейсы готовить до интеграции модели, как требует владелец.
+Сперва изучить существующие caps/slots и выбрать ограниченный протокол без
+хранения user pointers, описать состояние loading/cancel/FS failure. Затем
+реализовать и проверить реальное редактирование/сохранение во время загрузки
+большого .nos, Stop на loading, fault FS/loader, права и отсутствие PMM утечек.
+Особое внимание: согласованность файла при параллельной записи, чужая транзакция,
+сессии после замены слота и cleanup при закрытии controller. Работа только на
+тестовых дисках до успешного regression; текущий ISO/VM v20 — рабочий checkpoint.
+
+После этого — общий manager/несколько задач, объектные права/отзыв, большие
+файлы/каталоги/mappings, collector/подписки, семантические API GUI. Все интерфейсы
+готовить до интеграции модели, как требует владелец.
 
 ## Публикация и данные
 
