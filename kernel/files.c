@@ -32,7 +32,7 @@ static bool rpc(struct fs_message *q, struct fs_message *r) {
     }
     return true;
 }
-bool filesystem_execute(const char *name, const char *arguments, bool file_access) {
+bool filesystem_load(const char *name, const void **file, uint64_t *size) {
     struct fs_message q = {.op = FS_STAT}, r;
     unsigned length = 0;
     while (name[length] && length < 16)
@@ -59,7 +59,15 @@ bool filesystem_execute(const char *name, const char *arguments, bool file_acces
             executable[q.offset + i] = (uint8_t)r.data[i];
         q.offset += r.size;
     }
-    return process_run_file(executable, bytes, arguments, file_access);
+    *file = executable;
+    *size = bytes;
+    return true;
+}
+bool filesystem_execute(const char *name, const char *arguments, bool file_access) {
+    const void *file;
+    uint64_t size;
+    return filesystem_load(name, &file, &size) &&
+           process_run_file(file, size, arguments, file_access);
 }
 bool filesystem_command(const char *command, char *args) {
     bool file_access = same(command, "runfs");

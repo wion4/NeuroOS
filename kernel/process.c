@@ -16,7 +16,7 @@ _Static_assert(sizeof(struct cpu_context) == 176, "ASM full frame");
 #define TASKS 9
 #define SEND 1u
 #define RECEIVE 2u
-enum state { READY, EXITED, FAULTED, EXPIRED, SUSPENDED, SLEEPING, WAITING };
+enum state { READY, EXITED, FAULTED, EXPIRED, SUSPENDED, SLEEPING, WAITING, CANCELLED };
 struct capability {
     unsigned endpoint, rights;
 };
@@ -30,6 +30,9 @@ struct task {
     bool ipc_idle, desktop;
     uint64_t fault, error, address, status;
     uint64_t wake_tick;
+    uint64_t fs_session, reply_session;
+    unsigned reply_endpoint;
+    bool fs_broker, reply_control;
 };
 static struct task tasks[TASKS];
 static uint8_t stacks[TASKS][16384] __attribute__((aligned(16)));
@@ -47,6 +50,16 @@ static struct desktop_launch_result *captured_output;
 static uint64_t launch_destination;
 static bool launch_pending;
 static bool pending_ai;
+static bool pending_native_start, pending_native_recovery;
+static uint64_t next_identity = 1;
+static struct native_job_state {
+    struct native_job_info info;
+    bool files, close_sent, close_acked;
+} native_job;
+static long native_control(struct task *, uint64_t op, uint64_t address, uint64_t bytes);
+static void advance_native_job(void);
+static void discard_native_job(void);
+static void start_native_job(void);
 static struct ai_session desktop_ai;
 static struct task parked_server;
 static struct task parked_ai;
@@ -70,25 +83,47 @@ void process_filesystem_fault_after_io(unsigned operations) { fault_after_io = o
 struct message {
     uint8_t data[64];
     uint64_t size, sender;
+    uint64_t reply_session;
+    unsigned reply_endpoint;
+    bool control;
 };
 struct endpoint {
     struct message queue[8];
     unsigned head, count, owner, producer;
+    uint64_t session;
 };
 /* Foreground FS uses 0/1. Background inference has a separate 2/3 pair. */
-static struct endpoint endpoints[4];
+static struct endpoint endpoints[5];
 extern char user_program_start[], user_program_end[];
 extern void process_enter(struct cpu_context *, uint64_t *);
 extern __attribute__((noreturn)) void process_leave(uint64_t);
 extern void timer_irq(void);
 
 static bool permits(const struct task *task, uint64_t handle, unsigned rights) {
-    return handle < 4 && task->caps[handle].endpoint < 4 &&
+    return handle < 4 && task->caps[handle].endpoint < 5 &&
            (task->caps[handle].rights & rights) == rights;
 }
 static bool task_alive(const struct task *task) {
-    return task->state == READY || task->state == SLEEPING || task->state == SUSPENDED ||
-           task->state == WAITING;
+    return task->space.root && (task->state == READY || task->state == SLEEPING ||
+                                task->state == SUSPENDED || task->state == WAITING);
+}
+static bool file_server_task(const struct task *task) {
+    return task->caps[3].endpoint == 2 && task->caps[3].rights == 4;
+}
+static uint64_t allocate_identity(void) {
+    if (next_identity >= 0x7fffffffffffffffull)
+        return 0;
+    return next_identity++;
+}
+static bool producer_alive(const struct endpoint *ep) {
+    if (ep == &endpoints[0] && file_server_task(&tasks[ep->owner])) {
+        for (unsigned i = 0; i < task_count; ++i)
+            if (task_alive(&tasks[i]) && tasks[i].caps[1].endpoint == 0 &&
+                (tasks[i].caps[1].rights & SEND))
+                return true;
+        return false;
+    }
+    return task_alive(&tasks[ep->producer]);
 }
 static void resume_wait(struct task *task) {
     if (task->state == WAITING) {
@@ -158,11 +193,15 @@ static void syscall(struct task *task) {
         for (uint64_t i = 0; i < f->rsi; ++i)
             if ((text[i] >= 32 && text[i] <= 126) || text[i] == '\n') {
                 console_char(text[i]);
-                if (captured_output && !task->caps[3].rights) {
-                    if (captured_output->bytes + 1 < sizeof(captured_output->output))
-                        captured_output->output[captured_output->bytes++] = text[i];
+                struct desktop_launch_result *output =
+                    current == 4 && native_job.info.state == NOS_JOB_RUNNING
+                        ? &native_job.info.result
+                        : captured_output;
+                if (output && !task->caps[3].rights) {
+                    if (output->bytes + 1 < sizeof(output->output))
+                        output->output[output->bytes++] = text[i];
                     else
-                        captured_output->truncated = 1;
+                        output->truncated = 1;
                 }
             }
         f->rax = f->rsi;
@@ -188,6 +227,38 @@ static void syscall(struct task *task) {
             break;
         }
         if (send) {
+            bool fs_reply = file_server_task(task) && f->rdi == 2;
+            if (fs_reply && (task->reply_control || (native_job.info.state == NOS_JOB_CLOSING &&
+                                                     task->reply_session == native_job.info.id))) {
+                struct fs_message reply;
+                if (f->rdx != sizeof(reply) ||
+                    !user_copy_from(&task->space, &reply, f->rsi, sizeof(reply))) {
+                    f->rax = (uint64_t)-14;
+                    break;
+                }
+                if (task->reply_control) {
+                    if (reply.op != FS_CLIENT_CLOSED || reply.status ||
+                        task->reply_session != native_job.info.id) {
+                        f->rax = (uint64_t)-22;
+                        break;
+                    }
+                    native_job.close_acked = true;
+                    task->reply_control = false;
+                }
+                task->ipc_idle = true;
+                break; /* Kernel notification ack or a dead client's obsolete reply. */
+            }
+            if (fs_reply) {
+                if (task->reply_endpoint >= 5) {
+                    f->rax = (uint64_t)-32;
+                    break;
+                }
+                ep = &endpoints[task->reply_endpoint];
+                if (ep->session != task->reply_session) {
+                    f->rax = (uint64_t)-32;
+                    break;
+                }
+            }
             if (!task_alive(&tasks[ep->owner])) {
                 f->rax = (uint64_t)-32;
                 break;
@@ -197,21 +268,33 @@ static void syscall(struct task *task) {
                 break;
             }
             struct message *m = &ep->queue[(ep->head + ep->count) % 8];
+            *m = (struct message){0};
+            if (ep == &endpoints[0] && file_server_task(&tasks[ep->owner])) {
+                unsigned reply = task->caps[2].endpoint;
+                if ((!task->fs_broker && !task->fs_session) || reply >= 5 ||
+                    !(task->caps[2].rights & RECEIVE) || endpoints[reply].owner != current ||
+                    endpoints[reply].session != task->fs_session) {
+                    f->rax = (uint64_t)-1;
+                    break;
+                }
+                m->sender = task->fs_session;
+                m->reply_session = task->fs_session;
+                m->reply_endpoint = reply;
+            } else
+                m->sender = current;
             if (!user_copy_from(&task->space, m->data, f->rsi, (size_t)f->rdx)) {
                 ++bad_pointers;
                 f->rax = (uint64_t)-14;
                 break;
             }
             m->size = f->rdx;
-            m->sender = current;
             ++ep->count;
             ++sent;
-            if (task->caps[3].endpoint == 2 && task->caps[3].rights == 4 &&
-                task->caps[f->rdi].endpoint == 1 && f->rdx == 64)
+            if (fs_reply && f->rdx == 64)
                 task->ipc_idle = true; /* The trusted server has finished this request. */
         } else {
             if (!ep->count) {
-                f->rax = (uint64_t)(task_alive(&tasks[ep->producer]) ? -11 : -32);
+                f->rax = (uint64_t)(producer_alive(ep) ? -11 : -32);
                 if (call == 16 && (long)f->rax == -11)
                     task->state = WAITING;
                 break;
@@ -228,6 +311,11 @@ static void syscall(struct task *task) {
             }
             f->rax = m->size;
             f->rdx = m->sender;
+            if (file_server_task(task)) {
+                task->reply_session = m->reply_session;
+                task->reply_endpoint = m->reply_endpoint;
+                task->reply_control = m->control;
+            }
             ep->head = (ep->head + 1) % 8;
             --ep->count;
             ++received;
@@ -310,7 +398,7 @@ static void syscall(struct task *task) {
             f->rax = (uint64_t)-1;
             break;
         }
-        if (ai_job_active) {
+        if (ai_job_active || native_job.info.state != NOS_JOB_EMPTY) {
             f->rax = (uint64_t)-16;
             break;
         }
@@ -342,6 +430,7 @@ static void syscall(struct task *task) {
         launch_destination = f->rsi;
         launch_pending = true;
         pending_ai = false;
+        pending_native_start = pending_native_recovery = false;
         task->state = SUSPENDED;
         break;
     }
@@ -350,7 +439,7 @@ static void syscall(struct task *task) {
             f->rax = (uint64_t)-1;
             break;
         }
-        if (ai_job_active) {
+        if (ai_job_active || native_job.info.state != NOS_JOB_EMPTY) {
             f->rax = (uint64_t)-16;
             break;
         }
@@ -378,11 +467,23 @@ static void syscall(struct task *task) {
         launch_destination = f->rsi;
         launch_pending = true;
         pending_ai = true;
+        pending_native_start = pending_native_recovery = false;
         task->state = SUSPENDED;
         break;
     }
     case 15:
         f->rax = (uint64_t)desktop_ai_job(task, f->rdi, f->rsi, f->rdx);
+        break;
+    case 19:
+        if (!f->rdi || f->rdi > 1000)
+            f->rax = (uint64_t)-22;
+        else {
+            task->wake_tick = timer_ticks() + f->rdi;
+            task->state = SLEEPING;
+        }
+        break;
+    case 20:
+        f->rax = (uint64_t)native_control(task, f->rdi, f->rsi, f->rdx);
         break;
     case 17: {
         if (f->rdi != 3 || task->caps[3].endpoint != 3 || task->caps[3].rights != 16 || !ai_model) {
@@ -421,12 +522,17 @@ static struct cpu_context *choose_next(void) {
         paging_switch(paging_kernel_root());
         process_leave(saved_kernel_rsp);
     }
+    /* Revoke the dead child's queued requests before the service runs again,
+       rather than waiting for a later UI status poll. RPC loader helpers are
+       not the desktop and must not advance a job before its ELF is loaded. */
+    if (tasks[1].desktop)
+        advance_native_job();
     for (;;) {
         bool sleeping = false;
         for (unsigned i = 0; i < task_count; ++i) {
             if (tasks[i].state == WAITING && !(job_done && i == 2)) {
                 struct endpoint *ep = &endpoints[tasks[i].caps[tasks[i].context.rdi].endpoint];
-                if (ep->count || !task_alive(&tasks[ep->producer])) {
+                if (ep->count || !producer_alive(ep)) {
                     tasks[i].state = READY;
                     tasks[i].context.rax = 16;
                     syscall(&tasks[i]);
@@ -441,7 +547,7 @@ static struct cpu_context *choose_next(void) {
         }
         for (unsigned i = 1; i <= task_count; ++i) {
             unsigned next = (current + i) % task_count;
-            if (tasks[next].state != READY || (job_done && next == 2))
+            if (!tasks[next].space.root || tasks[next].state != READY || (job_done && next == 2))
                 continue;
             if (next != current)
                 ++switches;
@@ -458,6 +564,193 @@ static struct cpu_context *choose_next(void) {
     running = false;
     paging_switch(paging_kernel_root());
     process_leave(saved_kernel_rsp);
+}
+static void purge_native_requests(void) {
+    struct message keep[8];
+    unsigned count = 0;
+    for (unsigned i = 0; i < endpoints[0].count; ++i) {
+        struct message m = endpoints[0].queue[(endpoints[0].head + i) % 8];
+        if (m.sender != native_job.info.id && !m.control)
+            keep[count++] = m;
+    }
+    endpoints[0].head = 0;
+    endpoints[0].count = count;
+    for (unsigned i = 0; i < count; ++i)
+        endpoints[0].queue[i] = keep[i];
+    endpoints[4].head = endpoints[4].count = 0;
+}
+static void finish_native_job(void) {
+    native_job.info.state = NOS_JOB_FINISHED;
+    endpoints[4] = (struct endpoint){0};
+    task_count = 2;
+    console_write("DESKTOP CHILD FINISHED\n");
+}
+static void advance_native_job(void) {
+    if (native_job.info.state == NOS_JOB_RUNNING && !task_alive(&tasks[4])) {
+        struct desktop_launch_result *r = &native_job.info.result;
+        r->kind = tasks[4].state == EXITED      ? NOS_LAUNCH_EXITED
+                  : tasks[4].state == EXPIRED   ? NOS_LAUNCH_TIMED_OUT
+                  : tasks[4].state == CANCELLED ? NOS_LAUNCH_CANCELLED
+                                                : NOS_LAUNCH_FAULTED;
+        r->exit_code = tasks[4].status;
+        r->fault = (uint32_t)tasks[4].fault;
+        if (r->kind == NOS_LAUNCH_EXITED) {
+            console_write("EXIT CODE ");
+            console_number(r->exit_code);
+            console_write("\n");
+        } else if (r->kind == NOS_LAUNCH_CANCELLED)
+            console_write("NATIVE JOB CANCELLED\n");
+        purge_native_requests();
+        if (current == 4)
+            paging_switch(paging_kernel_root());
+        user_space_destroy(&tasks[4].space);
+        tasks[4] = (struct task){.state = EXITED};
+        native_job.info.state = NOS_JOB_CLOSING;
+        if (!native_job.files) {
+            finish_native_job();
+            return;
+        }
+    }
+    if (native_job.info.state != NOS_JOB_CLOSING || !task_alive(&tasks[0]))
+        return;
+    if (native_job.close_acked) {
+        console_write("NATIVE JOB FS SESSION CLOSED\n");
+        finish_native_job();
+    } else if (!native_job.close_sent && endpoints[0].count < 8) {
+        struct fs_message close = {.op = FS_CLIENT_CLOSED};
+        for (unsigned i = 0; i < 8; ++i)
+            close.data[i] = (char)(native_job.info.id >> (8 * i));
+        struct message *m = &endpoints[0].queue[(endpoints[0].head + endpoints[0].count) % 8];
+        *m = (struct message){.size = sizeof(close),
+                              .sender = 0,
+                              .reply_session = native_job.info.id,
+                              .reply_endpoint = 4,
+                              .control = true};
+        for (unsigned i = 0; i < sizeof(close); ++i)
+            m->data[i] = ((const uint8_t *)&close)[i];
+        ++endpoints[0].count;
+        ++sent;
+        native_job.close_sent = true;
+    }
+}
+static void discard_native_job(void) {
+    if (native_job.info.state == NOS_JOB_EMPTY)
+        return;
+    if (native_job.info.state != NOS_JOB_FINISHED) {
+        purge_native_requests();
+        user_space_destroy(&tasks[4].space);
+        tasks[4] = (struct task){.state = EXITED};
+        /* Parent death: discard an in-flight service session instead of
+           replaying IO. The normal supervisor remounts committed roots. */
+        if (native_job.files)
+            tasks[0].ipc_idle = false;
+    }
+    native_job = (struct native_job_state){0};
+    endpoints[4] = (struct endpoint){0};
+    task_count = 2;
+}
+static bool valid_launch(const struct desktop_launch_request *q) {
+    unsigned n = 0;
+    while (n < 16 && q->name[n])
+        ++n;
+    return n >= 5 && n <= 15 && q->name[n - 4] == '.' && q->name[n - 3] == 'n' &&
+           q->name[n - 2] == 'o' && q->name[n - 1] == 's' && !q->arguments[79] &&
+           !(q->flags & ~NOS_LAUNCH_FILES);
+}
+static long native_control(struct task *desktop, uint64_t op, uint64_t address, uint64_t bytes) {
+    if (!desktop->desktop || current != 1)
+        return -1;
+    if (op == NOS_JOB_START) {
+        if (native_job.info.state != NOS_JOB_EMPTY || ai_job_active || task_count != 2)
+            return -16;
+        if (bytes != sizeof(launch_request) ||
+            !user_copy_from(&desktop->space, &launch_request, address, sizeof(launch_request)))
+            return -14;
+        if (!valid_launch(&launch_request))
+            return -22;
+        if (!task_alive(&tasks[0]) || !tasks[0].ipc_idle || endpoints[0].count ||
+            endpoints[1].count)
+            return -16;
+        uint64_t id = allocate_identity();
+        if (!id)
+            return -75;
+        native_job.info = (struct native_job_info){
+            .id = id, .state = NOS_JOB_RUNNING, .result = {.kind = NOS_LAUNCH_LOAD_ERROR}};
+        native_job.files = (launch_request.flags & NOS_LAUNCH_FILES) != 0;
+        launch_pending = pending_native_start = true;
+        pending_ai = pending_native_recovery = false;
+        desktop->state = SUSPENDED;
+        return 0; /* Replaced with the job ID after loading on the kernel stack. */
+    }
+    if (op == NOS_JOB_POLL) {
+        uint64_t id;
+        if (bytes != sizeof(struct native_job_info))
+            return -22;
+        if (!user_check_write(&desktop->space, address, (size_t)bytes) ||
+            !user_copy_from(&desktop->space, &id, address, sizeof(id)))
+            return -14;
+        if (native_job.info.state == NOS_JOB_EMPTY || id != native_job.info.id)
+            return -2;
+        advance_native_job();
+        if (native_job.info.state == NOS_JOB_CLOSING && !task_alive(&tasks[0])) {
+            launch_destination = address;
+            launch_pending = pending_native_recovery = true;
+            pending_ai = pending_native_start = false;
+            desktop->state = SUSPENDED;
+            return 0;
+        }
+        return user_copy_to(&desktop->space, address, &native_job.info, sizeof(native_job.info))
+                   ? 0
+                   : -14;
+    }
+    if (op == NOS_JOB_CANCEL || op == NOS_JOB_REAP) {
+        if (bytes)
+            return -22;
+        if (native_job.info.state == NOS_JOB_EMPTY || address != native_job.info.id)
+            return -2;
+        if (op == NOS_JOB_CANCEL) {
+            if (native_job.info.state != NOS_JOB_RUNNING || !task_alive(&tasks[4]))
+                return -16;
+            tasks[4].state = CANCELLED;
+        } else {
+            if (native_job.info.state != NOS_JOB_FINISHED)
+                return -16;
+            native_job = (struct native_job_state){0};
+        }
+        return 0;
+    }
+    return -22;
+}
+static void start_native_job(void) {
+    const void *file;
+    uint64_t size, entry;
+    tasks[4] = (struct task){0};
+    if (!filesystem_load(launch_request.name, &file, &size) ||
+        !user_space_elf(&tasks[4].space, file, size, &entry)) {
+        finish_native_job();
+        return;
+    }
+    unsigned n = 0;
+    while (launch_request.arguments[n])
+        ++n;
+    if (!user_copy_to(&tasks[4].space, USER_STACK + 0x100, launch_request.arguments, n + 1)) {
+        user_space_destroy(&tasks[4].space);
+        finish_native_job();
+        return;
+    }
+    fpu_init(&tasks[4].fp);
+    tasks[4].context = (struct cpu_context){.rip = entry,
+                                            .cs = 0x33,
+                                            .ss = 0x2b,
+                                            .flags = 0x202,
+                                            .rsp = USER_ELF_STACK_TOP - 16,
+                                            .rdi = USER_STACK + 0x100};
+    tasks[4].fs_session = native_job.info.id;
+    if (native_job.files) {
+        tasks[4].caps[1] = (struct capability){0, SEND};
+        tasks[4].caps[2] = (struct capability){4, RECEIVE};
+    }
+    console_write("NATIVE JOB STARTED\n");
 }
 struct cpu_context *process_trap(struct cpu_context *frame, uint64_t cr2) {
     if (frame->vector == 32)
@@ -595,7 +888,8 @@ bool process_services(const void *server, uint64_t server_size, const void *clie
     for (unsigned i = 0; i < TASKS; ++i)
         tasks[i] = (struct task){0};
     for (unsigned i = 0; i < 2; ++i)
-        endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+        endpoints[i] = (struct endpoint){
+            .owner = i, .producer = 1 - i, .session = i ? tasks[1].fs_session : 0};
     sent = received = denied = bad_pointers = unknown_calls = switches = 0;
     uint64_t entry[2];
     bool created = user_space_elf(&tasks[0].space, server, server_size, &entry[0]) &&
@@ -715,6 +1009,7 @@ bool process_file_request(const void *request, void *response) {
     uint64_t entry;
     if (!user_space_elf(&tasks[1].space, file_client, file_client_size, &entry))
         goto done;
+    tasks[1].fs_broker = true; /* Stable logical kernel session 0 across RPC helpers. */
     const uint64_t boot = USER_STACK + 0x100;
     if (!user_copy_to(&tasks[1].space, boot, request, 64)) {
         user_space_destroy(&tasks[1].space);
@@ -730,7 +1025,8 @@ bool process_file_request(const void *request, void *response) {
     tasks[1].caps[1] = (struct capability){0, SEND};
     tasks[1].caps[2] = (struct capability){1, RECEIVE};
     for (unsigned i = 0; i < 2; ++i)
-        endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+        endpoints[i] = (struct endpoint){
+            .owner = i, .producer = 1 - i, .session = i ? tasks[1].fs_session : 0};
     current = 0;
     running = true;
     fpu_begin();
@@ -771,6 +1067,8 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
     }
     tasks[app] = (struct task){0};
     tasks[app].desktop = desktop_launch;
+    if (file_access && !(tasks[app].fs_session = allocate_identity()))
+        goto done;
     if (!user_space_elf(&tasks[app].space, file, size, &entry)) {
         console_write("ERROR: invalid or unsupported NOS executable\n");
         goto done;
@@ -793,7 +1091,8 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         tasks[app].caps[1] = (struct capability){0, SEND};
         tasks[app].caps[2] = (struct capability){1, RECEIVE};
         for (unsigned i = 0; i < 2; ++i)
-            endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+            endpoints[i] = (struct endpoint){
+                .owner = i, .producer = 1 - i, .session = i ? tasks[1].fs_session : 0};
     }
     for (;;) {
         current = tasks[0].space.root && tasks[0].state == READY ? 0 : app;
@@ -812,7 +1111,12 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
            runs as an ordinary task with only explicitly requested FS rights. */
         launch_pending = false;
         desktop_launch = false;
-        if (pending_ai) {
+        if (pending_native_start) {
+            start_native_job();
+        } else if (pending_native_recovery) {
+            native_job.info.cleanup_error = -5;
+            finish_native_job();
+        } else if (pending_ai) {
             if (desktop_ai.request.op == AI_UNLOAD)
                 desktop_ai.status = process_ai_reset() ? 0 : -16;
             else if (!process_ai_request(&desktop_ai))
@@ -828,19 +1132,25 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         suspended_desktop = (struct task){0};
         tasks[1].state = READY;
         tasks[1].ticks = 0;
-        tasks[1].context.rax =
-            user_copy_to(&tasks[1].space, launch_destination,
-                         pending_ai ? (const void *)&desktop_ai : (const void *)&launch_result,
-                         pending_ai ? sizeof(desktop_ai) : sizeof(launch_result))
-                ? 0
-                : (uint64_t)-14;
+        if (pending_native_start)
+            tasks[1].context.rax = native_job.info.id;
+        else if (pending_native_recovery)
+            tasks[1].context.rax = 0; /* Result copied after service recovery below. */
+        else
+            tasks[1].context.rax =
+                user_copy_to(&tasks[1].space, launch_destination,
+                             pending_ai ? (const void *)&desktop_ai : (const void *)&launch_result,
+                             pending_ai ? sizeof(desktop_ai) : sizeof(launch_result))
+                    ? 0
+                    : (uint64_t)-14;
         tasks[0] = parked_server;
         tasks[0].ticks = 0;
         task_count = 2;
         budget = 1000;
         interactive = true;
         for (unsigned i = 0; i < 2; ++i)
-            endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+            endpoints[i] = (struct endpoint){
+                .owner = i, .producer = 1 - i, .session = i ? tasks[1].fs_session : 0};
         if (!tasks[0].space.root) {
             /* Recovery is a new request, never a replay of a child write. */
             struct fs_message q = {.op = FS_LIST}, r;
@@ -852,13 +1162,31 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
             budget = 1000;
             interactive = true;
             for (unsigned i = 0; i < 2; ++i)
-                endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+                endpoints[i] = (struct endpoint){
+                    .owner = i, .producer = 1 - i, .session = i ? tasks[1].fs_session : 0};
         }
         if (!tasks[0].space.root)
             tasks[0].state = FAULTED;
-        console_write("DESKTOP CHILD FINISHED\n");
+        if (pending_native_recovery) {
+            if (tasks[0].space.root)
+                native_job.info.cleanup_error = 0;
+            tasks[1].context.rax = user_copy_to(&tasks[1].space, launch_destination,
+                                                &native_job.info, sizeof(native_job.info))
+                                       ? 0
+                                       : (uint64_t)-14;
+        }
+        if (native_job.info.state == NOS_JOB_RUNNING || native_job.info.state == NOS_JOB_CLOSING) {
+            task_count = 5;
+            tasks[2] = tasks[3] = (struct task){.state = EXITED};
+            endpoints[4] =
+                (struct endpoint){.owner = 4, .producer = 0, .session = native_job.info.id};
+        } else if (!pending_native_start && !pending_native_recovery)
+            console_write("DESKTOP CHILD FINISHED\n");
+        pending_native_start = pending_native_recovery = false;
     }
     ok = tasks[app].state == EXITED;
+    if (tasks[app].desktop)
+        discard_native_job();
     if (tasks[app].desktop && ai_job_active) {
         discard_ai_job();
         ai_started = false;
@@ -880,10 +1208,13 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
     if (file_access) {
         park_filesystem();
     }
+    uint64_t closed_session = tasks[app].fs_session;
     user_space_destroy(&tasks[app].space);
     if (file_access && file_server) {
-        struct fs_message q = {.op = FS_ABORT}, r;
-        /* A dead client cannot leave an open transaction or stale reply behind. */
+        struct fs_message q = {.op = FS_CLIENT_CLOSED}, r;
+        for (unsigned i = 0; i < 8; ++i)
+            q.data[i] = (char)(closed_session >> (8 * i));
+        /* Authenticated kernel broker closes the user's logical session. */
         (void)process_file_request(&q, &r);
     }
     uint64_t ai_pages_after = parked_ai.space.count + parked_ai.space.heap_pages;
@@ -966,7 +1297,7 @@ static long desktop_ai_job(struct task *desktop, uint64_t op, uint64_t address, 
     if (!ai_server_code)
         return -19;
     if (op == AI_JOB_START) {
-        if (ai_job_active || task_count != 2)
+        if (ai_job_active || native_job.info.state != NOS_JOB_EMPTY || task_count != 2)
             return -16;
         struct ai_request request;
         if (bytes != sizeof(request) ||
@@ -1073,7 +1404,8 @@ bool process_ai_request(struct ai_session *session) {
     tasks[1].caps[1] = (struct capability){0, SEND};
     tasks[1].caps[2] = (struct capability){1, RECEIVE};
     for (unsigned i = 0; i < 2; ++i)
-        endpoints[i] = (struct endpoint){.owner = i, .producer = 1 - i};
+        endpoints[i] = (struct endpoint){
+            .owner = i, .producer = 1 - i, .session = i ? tasks[1].fs_session : 0};
     task_count = 2;
     budget = 1000;
     interactive = true;

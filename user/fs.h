@@ -12,6 +12,9 @@
 #define FS_BEGIN 10u
 #define FS_COMMIT 11u
 #define FS_ABORT 12u
+/* Service control message: accepted only from kernel-authenticated session 0.
+   data[0..7] contains the closing logical session, little endian. */
+#define FS_CLIENT_CLOSED 13u
 enum { FS_CREATE = 1, FS_WRITE, FS_READ, FS_DELETE, FS_LIST, FS_STAT, FS_QUIT, FS_TRUNCATE };
 struct fs_message {
     uint32_t op, offset;

@@ -23,5 +23,6 @@ bool filesystem_store(const char *name, const void *data, unsigned bytes);
 void editor_run(const char *name);
 bool kernel_desktop(void);
 bool filesystem_execute(const char *name, const char *arguments, bool file_access);
-bool kernel_ai(const char *prompt,bool trace);
+bool filesystem_load(const char *name, const void **file, uint64_t *size);
+bool kernel_ai(const char *prompt, bool trace);
 #endif

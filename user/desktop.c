@@ -69,6 +69,8 @@ static char program_name[16] = "hello.nos", program_arguments[80];
 static bool program_files, program_arguments_focus = true, program_has_result;
 static unsigned program_scroll;
 static struct desktop_launch_result program_result;
+static uint64_t program_job;
+static struct native_job_info program_status;
 static char ai_prompt[56] = "Once upon a time";
 static struct ai_session ai_result;
 static bool ai_has_result, ai_busy;
@@ -293,13 +295,19 @@ static void save_note(bool overwrite) {
             return;
         }
         if (size != -2) {
-            message("Could not check the destination. Nothing saved.");
+            message(size == -16 ? "Another program is writing. Your text is preserved; save later."
+                                : "Could not check the destination. Nothing saved.");
+            if (size == -16)
+                say("DESKTOP NOTE SAVE BUSY\n");
             return;
         }
     }
     long n = nos_file_write(filename, note, note_len);
     if (n != (long)note_len) {
-        message("Save failed. Your text is still in the editor.");
+        message(n == -16 ? "Another program is writing. Your text is preserved; save later."
+                         : "Save failed. Your text is still in the editor.");
+        if (n == -16)
+            say("DESKTOP NOTE SAVE BUSY\n");
         return;
     }
     memcpy(loaded_name, filename, strlen(filename) + 1);
@@ -508,8 +516,19 @@ static bool program_suffix(const char *name) {
     size_t n = strlen(name);
     return n >= 5 && !strcmp(name + n - 4, ".nos");
 }
+static bool program_settings_locked(void) {
+    if (!program_job)
+        return false;
+    message("Stop the current program before changing its launch settings or permissions.");
+    say("DESKTOP JOB SETTINGS LOCKED\n");
+    return true;
+}
 static void open_file(const char *name) {
     if (program_suffix(name)) {
+        if (program_settings_locked()) {
+            front(PROGRAMS);
+            return;
+        }
         snprintf(program_name, sizeof(program_name), "%s", name);
         program_arguments[0] = 0;
         program_files = false;
@@ -522,6 +541,10 @@ static void open_file(const char *name) {
         request_open(name);
 }
 static void build_source(const char *name) {
+    if (program_settings_locked()) {
+        front(PROGRAMS);
+        return;
+    }
     size_t n = strlen(name);
     if (n < 3 || strcmp(name + n - 2, ".c") || n > 13) {
         message("Choose a C source ending in .c (name up to 13 characters).");
@@ -540,6 +563,12 @@ static void build_source(const char *name) {
         "Compiler needs file access: enable it, then Run. Existing files are preserved on error.");
 }
 static void run_program(void) {
+    if (program_job) {
+        long e = call3(20, NOS_JOB_CANCEL, program_job, 0);
+        message(e < 0 ? "Program is already finishing. Waiting for cleanup."
+                      : "Stopping program and closing its file session...");
+        return;
+    }
     if (ai_busy) {
         message("Wait for AI generation, or cancel it in AI demo before running a program.");
         return;
@@ -552,27 +581,64 @@ static void run_program(void) {
     snprintf(q.name, sizeof(q.name), "%s", program_name);
     snprintf(q.arguments, sizeof(q.arguments), "%s", program_arguments);
     program_has_result = false;
-    message("Running native program. The desktop resumes when it finishes.");
+    message("Loading native program...");
     paint();
-    long e = call3(13, (uintptr_t)&q, (uintptr_t)&program_result, sizeof(q));
+    long e = call3(20, NOS_JOB_START, (uintptr_t)&q, sizeof(q));
     if (e < 0) {
         message("Program could not start. File service unavailable or request rejected.");
         return;
     }
+    program_job = (uint64_t)e;
+    program_status = (struct native_job_info){.id = program_job, .state = NOS_JOB_RUNNING};
+    program_result = (struct desktop_launch_result){0};
     program_has_result = true;
     program_scroll = 0;
+    message("Program is running. You can keep working; Stop cancels it.");
+    say("DESKTOP PROGRAM STARTED\n");
+}
+static void program_poll(void) {
+    if (!program_job)
+        return;
+    uint32_t old_state = program_status.state, old_bytes = program_result.bytes;
+    program_status.id = program_job;
+    if (call3(20, NOS_JOB_POLL, (uintptr_t)&program_status, sizeof(program_status)) < 0) {
+        message("Could not read program status. Use Console to close this session.");
+        return;
+    }
+    program_result = program_status.result;
+    if (old_state != program_status.state || old_bytes != program_result.bytes)
+        redraw = true;
+    if (program_status.state != NOS_JOB_FINISHED)
+        return;
+    if (call3(20, NOS_JOB_REAP, program_job, 0) < 0) {
+        message("Program cleanup has not finished yet.");
+        return;
+    }
+    program_job = 0;
     if (program_result.kind == NOS_LAUNCH_LOAD_ERROR)
         message("Could not load this file as a NeuroOS executable.");
     else if (program_result.kind == NOS_LAUNCH_FAULTED)
         message("Program fault contained. Your desktop and notes are still here.");
     else if (program_result.kind == NOS_LAUNCH_TIMED_OUT)
-        message("Program reached its CPU time limit. Desktop restored.");
+        message("Program reached its CPU time limit.");
+    else if (program_result.kind == NOS_LAUNCH_CANCELLED)
+        message("Program cancelled. Its memory and file session were released.");
     else
         message("Program finished. Your desktop and unsaved notes were preserved.");
-    refresh_files();
+    if (program_status.cleanup_error)
+        message("Program stopped. File service unavailable; use Console to restart it.");
+    else
+        refresh_files();
     say("DESKTOP PROGRAM RESULT\n");
 }
 static void program_key(uint32_t key) {
+    if (program_job) {
+        if (key == '\n' || key == 27)
+            run_program();
+        else
+            (void)program_settings_locked();
+        return;
+    }
     if (key == '\t') {
         program_arguments_focus = !program_arguments_focus;
         redraw = true;
@@ -613,14 +679,17 @@ static void draw_programs(struct window *w) {
     text(x, y + 9, "FILE", 1, MUTED);
     rect(x + 38, y, 185, 28, program_arguments_focus ? BG : EDGE);
     text(x + 47, y + 10, program_name, 1, INK);
-    button(x + 237, y, 80, "Run", true);
-    button(x + 330, y, 245, program_files ? "[x] Allow file access" : "[ ] Allow file access",
+    button(x + 237, y, 80, program_job ? "Stop" : "Run", true);
+    button(x + 330, y, 245,
+           program_job
+               ? (program_files ? "File access: allowed (fixed)" : "File access: off (fixed)")
+               : (program_files ? "[x] Allow file access" : "[ ] Allow file access"),
            false);
     text(x, y + 49, "ARGS", 1, MUTED);
     rect(x + 38, y + 39, w->w - 78, 28, program_arguments_focus ? EDGE : BG);
     unsigned args_length = (unsigned)strlen(program_arguments);
     text(x + 47, y + 49, program_arguments + (args_length > 75 ? args_length - 75 : 0), 1, INK);
-    if (program_arguments_focus)
+    if (program_arguments_focus && !program_job)
         rect(x + 47 + (int)(args_length > 75 ? 75 : args_length) * 6, y + 46, 1, 14, accent);
     rect(x, y + 81, w->w - 40, 235, BG);
     if (program_has_result) {
@@ -643,7 +712,11 @@ static void draw_programs(struct window *w) {
             }
         }
         char status[70];
-        if (program_result.kind == NOS_LAUNCH_EXITED)
+        if (program_job)
+            snprintf(status, sizeof(status),
+                     program_status.state == NOS_JOB_CLOSING ? "Closing file session..."
+                                                             : "Running / Stop to cancel");
+        else if (program_result.kind == NOS_LAUNCH_EXITED)
             snprintf(status, sizeof(status), "Exit code %llu%s",
                      (unsigned long long)program_result.exit_code,
                      program_result.truncated ? " / output truncated" : "");
@@ -651,6 +724,8 @@ static void draw_programs(struct window *w) {
             snprintf(status, sizeof(status), "Contained fault %u", program_result.fault);
         else if (program_result.kind == NOS_LAUNCH_TIMED_OUT)
             snprintf(status, sizeof(status), "CPU time limit reached");
+        else if (program_result.kind == NOS_LAUNCH_CANCELLED)
+            snprintf(status, sizeof(status), "Cancelled");
         else
             snprintf(status, sizeof(status), "Load error");
         text(x, y + 338, status, 1, accent);
@@ -1141,9 +1216,10 @@ static void click(void) {
                 program_arguments_focus = true;
             else if (inside(x + 237, y, 80, 28))
                 run_program();
-            else if (inside(x + 330, y, 245, 28))
-                program_files = !program_files;
-            else if (inside(x + 400, y + 326, 76, 28))
+            else if (inside(x + 330, y, 245, 28)) {
+                if (!program_settings_locked())
+                    program_files = !program_files;
+            } else if (inside(x + 400, y + 326, 76, 28))
                 program_scroll = program_scroll > 15 ? program_scroll - 15 : 0;
             else if (inside(x + 486, y + 326, 76, 28)) {
                 unsigned rows = output_rows(), limit = rows > 18 ? rows - 18 : 0;
@@ -1206,6 +1282,7 @@ int user_main(void) {
     say("DESKTOP READY\n");
     struct desktop_input old = {.x = -1, .y = -1};
     while (!exiting) {
+        program_poll();
         ai_poll();
         if (call3(11, 0, (uintptr_t)&input, 0) < 0) {
             free(pixels);

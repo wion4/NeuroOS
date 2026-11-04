@@ -71,7 +71,7 @@ def main():
         g.screenshot('native-hello')
         field('filedemo.nos');run(b'FILE ACCESS DENIED OR FAILED')
         g.click(585,148);run(b'C FILE LIBRARY PASS') # Explicit FS grant
-        field('filedemo.nos','backlog');run(b'FILESYSTEM CLIENT SESSION DISCARDED')
+        field('filedemo.nos','backlog');run(b'NATIVE JOB FS SESSION CLOSED')
         field('filedemo.nos','crash');run(b'FAULT 14 CONTAINED')
         g.screenshot('contained-fault')
         field('other.nos');run(b'FILE ACCESS DENIED OR FAILED')

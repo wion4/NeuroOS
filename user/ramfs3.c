@@ -20,6 +20,7 @@ int user_main(void) {
     fs_reset();
     long device = call3(9, 3, 0x1f7, 0);
     bool persistent = device >= 0 && device != 0 && device != 255, transaction = false;
+    uint64_t transaction_client = 0;
     if (persistent) {
         if (!storage_reset()) {
             say("ATA RESET FAILED\n");
@@ -59,19 +60,38 @@ int user_main(void) {
         bool complete = n == sizeof(q);
         if (!complete)
             r = (struct fs_message){.status = -22};
-        else if (q.op == 9)
+        else if (q.op == FS_CLIENT_CLOSED) {
+            r = (struct fs_message){.op = FS_CLIENT_CLOSED, .status = -1};
+            if (!sender) {
+                uint64_t client = 0;
+                for (unsigned i = 0; i < 8; ++i)
+                    client |= (uint64_t)(uint8_t)q.data[i] << (8 * i);
+                r.status = 0;
+                if (persistent)
+                    r.size = fs3_client_closed(&volume, client);
+                else if (transaction && transaction_client == client) {
+                    if (!fs_import(legacy_snapshot, sizeof(legacy_snapshot)))
+                        return 6;
+                    transaction = false;
+                    r.size = 1;
+                }
+            }
+        } else if (q.op == 9)
             r = (struct fs_message){.op = 9, .size = persistent ? 1 : 0};
         else if (persistent) {
             if (q.op == FS_QUIT)
                 r = (struct fs_message){.op = FS_QUIT, .status = -1};
             else
                 fs3_handle_client(&volume, sender, &q, &r);
-        } else if (q.op == FS_BEGIN) {
+        } else if (transaction && transaction_client != sender)
+            r = (struct fs_message){.op = q.op, .status = -16};
+        else if (q.op == FS_BEGIN) {
             r = (struct fs_message){.op = FS_BEGIN, .status = transaction ? -16 : 0};
             if (!transaction) {
                 if (!fs_export(legacy_snapshot, sizeof(legacy_snapshot)))
                     return 5;
                 transaction = true;
+                transaction_client = sender;
             }
         } else if (q.op == FS_COMMIT) {
             r = (struct fs_message){.op = FS_COMMIT, .status = transaction ? 0 : -22};

@@ -2,6 +2,7 @@
 #include "fs.h"
 static uint8_t backup[FS_SNAPSHOT_SIZE];
 static bool transaction;
+static uint64_t transaction_client;
 int user_main(void) {
     fs_reset();
     long device = call3(9, 3, 0x1f7, 0);
@@ -16,7 +17,8 @@ int user_main(void) {
     say(persistent ? "PERSISTENT FILE SERVICE READY\n" : "RAMFS SERVICE READY\n");
     for (;;) {
         struct fs_message request, response;
-        long n = receive_message(1, &request, sizeof(request));
+        uint64_t sender;
+        long n = receive_wait_from(1, &request, sizeof(request), &sender);
         if (n == -11) {
             yield();
             continue;
@@ -26,16 +28,33 @@ int user_main(void) {
         bool complete = n == sizeof(request);
         if (!complete)
             response = (struct fs_message){.status = -22};
-        else if (persistent && request.op == FS_QUIT)
+        else if (request.op == FS_CLIENT_CLOSED) {
+            response = (struct fs_message){.op = FS_CLIENT_CLOSED, .status = -1};
+            if (!sender) {
+                uint64_t client = 0;
+                for (unsigned i = 0; i < 8; ++i)
+                    client |= (uint64_t)(uint8_t)request.data[i] << (8 * i);
+                response.status = 0;
+                if (transaction && transaction_client == client) {
+                    if (!fs_import(backup, sizeof(backup)))
+                        return 6;
+                    transaction = false;
+                    response.size = 1;
+                }
+            }
+        } else if (persistent && request.op == FS_QUIT)
             response = (struct fs_message){.op = FS_QUIT, .status = -1};
         else if (request.op == 9)
             response = (struct fs_message){.op = 9, .size = persistent ? 1 : 0};
+        else if (transaction && transaction_client != sender)
+            response = (struct fs_message){.op = request.op, .status = -16};
         else if (request.op == FS_BEGIN) {
             response = (struct fs_message){.op = FS_BEGIN, .status = transaction ? -16 : 0};
             if (!transaction) {
                 if (!fs_export(backup, sizeof(backup)))
                     return 5;
                 transaction = true;
+                transaction_client = sender;
             }
         } else if (request.op == FS_COMMIT) {
             response = (struct fs_message){.op = FS_COMMIT, .status = transaction ? 0 : -22};

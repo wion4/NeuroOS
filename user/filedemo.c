@@ -151,6 +151,50 @@ int user_main(const char *args) {
         (void)*(volatile uint64_t *)0xffffffff80000000ull;
         return 14;
     }
+    if (args && args[0] == 'j') {
+        struct fs_message q = {.op = FS_CLIENT_CLOSED}, r;
+        if (nos_fs_request(&q, &r) != -1)
+            return 70;
+        if (call3(19, 0, 0, 0) != -22 || call3(19, 1001, 0, 0) != -22)
+            return 71;
+        q = (struct fs_message){.op = FS_BEGIN};
+        if (nos_fs_request(&q, &r))
+            return 72;
+        q.op = FS_CREATE;
+        const char name[] = "job-draft.tmp";
+        for (unsigned i = 0; i < sizeof(name); ++i)
+            q.name[i] = name[i];
+        long e = nos_fs_request(&q, &r);
+        if (e && e != -17)
+            return 73;
+        q.op = FS_TRUNCATE;
+        if (nos_fs_request(&q, &r))
+            return 74;
+        q.op = FS_WRITE;
+        q.size = 7;
+        const char data[] = "private";
+        for (unsigned i = 0; i < 7; ++i)
+            q.data[i] = data[i];
+        if (nos_fs_request(&q, &r))
+            return 75;
+        say("JOB PRIVATE TRANSACTION OPEN\n");
+        (void)call3(19, 1000, 0, 0);
+        return 0;
+    }
+    if (args && args[0] == 'r') {
+        say("JOB IPC LOOP READY\n");
+        for (unsigned i = 0; i < 100; ++i) {
+            if (nos_file_size("hello.nos") < 128 || nos_file_size("missing.tmp") != -2)
+                return 76;
+            (void)call3(19, 1, 0, 0);
+        }
+        say("JOB IPC LOOP PASS\n");
+        return 0;
+    }
+    if (args && args[0] == 'w') {
+        say("JOB IO WAIT\n");
+        (void)call3(19, 300, 0, 0);
+    }
     const char text[] = "written by C";
     char buffer[32];
     long n = nos_file_write("app.txt", text, sizeof(text) - 1);
@@ -169,7 +213,7 @@ int user_main(const char *args) {
         return 4;
     if (call3(11, 0, (uintptr_t)buffer, 0) != -1 || call3(12, 1, 0, 0) != -1 ||
         call3(13, 0, 0, 0) != -1 || call3(14, 0, 0, 0) != -1 || call3(15, 0, 0, 0) != -1 ||
-        call3(17, 3, ~0ull, 0) != -1)
+        call3(17, 3, ~0ull, 0) != -1 || call3(20, 0, 0, 0) != -1)
         return 5; /* Ordinary NOS files never inherit desktop/input rights. */
     say("C FILE LIBRARY PASS\n");
     return 0;
