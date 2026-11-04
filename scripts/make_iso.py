@@ -19,7 +19,7 @@ def main():
         raise SystemExit('Power off the NeuroOS VMware guest before rebuilding its ISO.')
     target = neuro.build()
     ai_demo=os.environ.get('NEUROOS_AI_DEMO')=='1'
-    apps=('ramfs','fsclient','hello','filedemo','libcdemo','floatdemo','compiler','desktop')+('airuntime','aiclient')*int(ai_demo)
+    apps=('ramfs','fsclient','hello','filedemo','libcdemo','floatdemo','compiler','desktop','loader')+('airuntime','aiclient')*int(ai_demo)
     output = neuro.ROOT / 'build/NeuroOS.iso'
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=3, joliet=3, rock_ridge='1.09', vol_ident='NEUROOS')

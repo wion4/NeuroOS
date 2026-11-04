@@ -68,6 +68,7 @@ int user_main(void) {
     events.capacity = 0;
     CHECK(call3(21, (uintptr_t)&events, sizeof(events), 0) == -22);
     CHECK(read_events(1) == -22);
+    CHECK(call3(22, 0, 0, 0) == -1); /* Even controller is not the boot loader. */
     struct desktop_launch_request q = {0};
     CHECK(call3(20, 99, 0, 0) == -22);
     CHECK(call3(20, NOS_JOB_START, 0, sizeof(q)) == -14);
@@ -115,7 +116,8 @@ int user_main(void) {
     uint64_t draft_id = (uint64_t)id;
     uint64_t deadline = (uint64_t)call3(5, 0, 0, 0) + 300;
     do {
-        CHECK(poll((uint64_t)id) == 0 && info.state == NOS_JOB_RUNNING);
+        CHECK(poll((uint64_t)id) == 0 &&
+              (info.state == NOS_JOB_LOADING || info.state == NOS_JOB_RUNNING));
         if (contains(info.result.output, "JOB PRIVATE TRANSACTION OPEN"))
             break;
         (void)call3(12, 1, 0, 0);
@@ -142,6 +144,10 @@ int user_main(void) {
         CHECK(poll((uint64_t)id) == 0);
         if (info.state == NOS_JOB_FINISHED)
             break;
+        if (info.state == NOS_JOB_LOADING) {
+            (void)call3(12, 1, 0, 0);
+            continue; /* Read snapshot serializes FS until image is staged. */
+        }
         char data[4];
         CHECK(nos_file_size("sentinel.txt") == 4);
         CHECK(nos_file_read("sentinel.txt", 0, data, 4) == 4);
@@ -155,7 +161,21 @@ int user_main(void) {
     CHECK(call3(20, NOS_JOB_REAP, (uint64_t)id, 0) == 0);
     id = start("bogus.nos", "", 0);
     CHECK(id > 0 && wait_finished((uint64_t)id) && info.result.kind == NOS_LAUNCH_LOAD_ERROR);
+    uint64_t bad_id = (uint64_t)id;
     CHECK(call3(20, NOS_JOB_REAP, (uint64_t)id, 0) == 0);
+    id = start("missing.nos", "", 0);
+    CHECK(id > 0 && wait_finished((uint64_t)id) && info.result.kind == NOS_LAUNCH_LOAD_ERROR);
+    uint64_t missing_id = (uint64_t)id;
+    CHECK(call3(20, NOS_JOB_REAP, (uint64_t)id, 0) == 0);
+    request = (struct fs_message){.op = FS_BEGIN};
+    CHECK(nos_fs_request(&request, &reply) == 0);
+    id = start("hello.nos", "", 0);
+    CHECK(id > 0 && wait_finished((uint64_t)id) && info.result.kind == NOS_LAUNCH_LOAD_ERROR);
+    uint64_t busy_id = (uint64_t)id;
+    CHECK(call3(20, NOS_JOB_REAP, (uint64_t)id, 0) == 0);
+    CHECK(nos_file_size("sentinel.txt") == 4); /* Desktop still owns its snapshot. */
+    request.op = FS_ABORT;
+    CHECK(nos_fs_request(&request, &reply) == 0);
     id = start("filedemo.nos", "heap", 0);
     CHECK(id > 0 && wait_finished((uint64_t)id) && info.result.kind == NOS_LAUNCH_EXITED &&
           !info.result.exit_code);
@@ -209,8 +229,16 @@ int user_main(void) {
                 observed |= 8;
             }
             if (event->kind == NOS_EVENT_LOAD_FAILED) {
-                CHECK(event->value == (uint64_t)-8);
-                observed |= 16;
+                if (event->job == bad_id) {
+                    CHECK(event->value == (uint64_t)-8);
+                    observed |= 16;
+                } else if (event->job == missing_id) {
+                    CHECK(event->value == (uint64_t)-2);
+                    observed |= 256;
+                } else {
+                    CHECK(event->job == busy_id && event->value == (uint64_t)-16);
+                    observed |= 512;
+                }
             }
             if (event->kind == NOS_EVENT_EXITED && event->job == heap_id) {
                 CHECK(event->pages > 400);
@@ -226,7 +254,7 @@ int user_main(void) {
             }
         }
     } while (events.count);
-    CHECK(observed == 255);
+    CHECK(observed == 1023);
     for (unsigned i = 0; i < 20; ++i) {
         id = start("hello.nos", "overflow", 0);
         CHECK(id > 0 && wait_finished((uint64_t)id));

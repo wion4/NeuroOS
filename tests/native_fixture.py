@@ -26,3 +26,20 @@ def seed_native_disk(disk, target):
         stream.truncate(64 * 1024 * 1024)
         stream.seek(64 * 512); stream.write(header + payload)
     return files
+
+def seed_fs3_disk(disk, files):
+    """Generate a sparse disposable volume through the real C FS3 backend."""
+    from test_fs3 import FS3Tests
+    disk = disk.resolve()
+    assert disk.is_relative_to(ROOT / 'build') and disk.name.endswith('-test-only.img')
+    FS3Tests.setUpClass()
+    backend = FS3Tests()
+    backend.setUp()
+    for name, data in files.items():
+        backend.replace(data, name)
+    assert not backend.disk.illegal
+    with disk.open('wb') as stream:
+        stream.truncate(64 * 1024 * 1024)
+        for sector, data in backend.disk.durable.items():
+            stream.seek(sector * 512)
+            stream.write(data)

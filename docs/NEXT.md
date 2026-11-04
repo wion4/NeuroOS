@@ -15,7 +15,31 @@ Goal активен; завершение отдельного теста/рел
 ident[8]=1. Прототип AI v0.0.17–18 сохранён optional и заморожен; не развивать
 модели/чат/inference до готовности основания. Требования — system-control.md.
 
-## Текущий checkpoint — v0.0.20
+## Текущий checkpoint — v0.0.21
+
+Приватный пользовательский loader читает согласованный executable до 1 МиБ;
+START возвращает ID сразу, LOADING=4, GUI принимает ввод, Stop работает до
+Started. Kernel syscall22 проверяет/копирует образ и заменяет task без наследования
+loader role/heap/прав. ABORT snapshot обязателен; file grant конечного приложения
+независим. Loading wall deadline 6000 ticks, у программы свежий CPU budget1000.
+Save/Files во время read snapshot могут получить busy; текст Notes сохраняется.
+CLI/совместимый syscall13 остаются синхронными. См. loader.md.
+
+Полный check-release --desktop PASS 24 этапа без AI; FS2 job controller PASS.
+Настоящий 1 МиБ, Stop loading, owner exit flags0, exact PMM, loader #PF,
+естественный deadline, FS mid-PIO #PF и чужой in-flight FS request проверены.
+Последний тест воспроизводил ложный отказ общей idle-проверки: исправлено,
+Started/exit42 происходит до завершения чужого STAT. Missing -2/чужой TX -16
+сохраняют snapshot настоящего owner. На копии 25 файлов старый compiler/SDK
+собрали C с puts, новый executable вернул37; оригиналы не менялись.
+
+ISO 0.0.21 4,114,432 байт без AI загружен в VMware. Девять user LOAD payloads,
+process.o/journal.o совпали с проверенными, весь flat disk и 25 файлов прежние.
+SHA 460d70eba035dd11e5e0fb4d3f20b66f9162a124886451510808a33c76a8d299.
+Backup work/backups/before-0.0.21-20261104-134713; manifest/report
+build/vmware-0.0.21-*.json; compatibility build/vmware-compat-0.0.21/result.json.
+
+## Предыдущий checkpoint — v0.0.20
 
 Модель не используется. Programs → Events: числовой lifecycle native jobs,
 owner/job/sequence/ticks, результат, наблюдённые peak pages/CPU ticks. Kernel
@@ -86,25 +110,28 @@ GDB stub своего QEMU; GUI/данные сохранены, write не по
 build/vmware-0.0.19-backup.json. Backup в work/backups/before-0.0.19-20261104-115750
 от workspace new-chat. Предыдущий ISO 0.0.18 сохранён вместе с копией диска.
 
-## Следующий ограниченный шаг — неблокирующая загрузка .nos
+## Следующий ограниченный шаг — файловые права по именам и операциям
 
-Сейчас START сохраняет desktop и синхронно читает ELF через kernel broker,
-создающий fsclient на каждый 32-байтовый RPC. Runtime уже фоновый, loading — нет.
-Выделить пользовательский loader с отдельной FS-сессией/ответом, чтением файла
-в его bounded память и передачей проверяемых bytes ядру. Не выдавать обычной
-.nos controller/display/ATA. Kernel ELF validation остаётся обязательной.
+Текущее NOS_LAUNCH_FILES выдаёт весь FS. Ограниченный private loader уже
+проверяет имя/операции в ядре. Обобщить policy для обычного native job: новый
+append-only START op с bounded списком до четырёх ASCII имён и явными правами
+read/write/create/delete. Прежний START/file flag оставить совместимым.
+Не выдавать обычной программе controller/loader/ATA/display или sender identity.
 
-Сперва изучить существующие caps/slots и выбрать ограниченный протокол без
-хранения user pointers, описать состояние loading/cancel/FS failure. Затем
-реализовать и проверить реальное редактирование/сохранение во время загрузки
-большого .nos, Stop на loading, fault FS/loader, права и отсутствие PMM утечек.
-Особое внимание: согласованность файла при параллельной записи, чужая транзакция,
-сессии после замены слота и cleanup при закрытии controller. Работа только на
-тестовых дисках до успешного regression; текущий ISO/VM v20 — рабочий checkpoint.
+Сначала отделить policy в проверяемый C модуль; затем привязать её snapshot
+к task/session при exec. Проверять каждый запрос до постановки в FS очередь,
+отклонять LIST и закрытие чужого клиента. В scoped режиме не разрешать операции
+над невыданными именами; read snapshot BEGIN/ABORT и mutating COMMIT должны
+соответствовать правам. Проверить попытки обхода через payload, переполнение,
+неверный grant/имя/op, чтение/запись чужого файла, создание/удаление и rollback.
+Это права по текущим именам, пока не stable object handles/rename/revocation.
+Частичный динамический отзыв не имитировать; Stop по-прежнему закрывает весь job.
 
-После этого — общий manager/несколько задач, объектные права/отзыв, большие
-файлы/каталоги/mappings, collector/подписки, семантические API GUI. Все интерфейсы
-готовить до интеграции модели, как требует владелец.
+Проверить настоящим ring3 controller/обычным C без модели, сохранить broad grant
+для компилятора/SDK, UI default-off и защиту данных. Затем необходимы scoped UI,
+общий manager/несколько задач, отдельный отзыв, большие files/mappings,
+collector/подписки и семантические API GUI. Пользователь уже разрешил продолжать;
+не завершать larger task только из-за публикации очередного checkpoint.
 
 ## Публикация и данные
 

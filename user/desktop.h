@@ -38,7 +38,7 @@ struct desktop_launch_result {
 #define NOS_JOB_POLL 1u
 #define NOS_JOB_CANCEL 2u
 #define NOS_JOB_REAP 3u
-enum { NOS_JOB_EMPTY, NOS_JOB_RUNNING, NOS_JOB_CLOSING, NOS_JOB_FINISHED };
+enum { NOS_JOB_EMPTY, NOS_JOB_RUNNING, NOS_JOB_CLOSING, NOS_JOB_FINISHED, NOS_JOB_LOADING };
 struct native_job_info {
     uint64_t id;
     uint32_t state;

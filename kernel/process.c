@@ -2,6 +2,7 @@
 #include "../user/ai.h"
 #include "../user/desktop.h"
 #include "../user/fs.h"
+#include "../user/loader.h"
 #include "alloc.h"
 #include "display.h"
 #include "exceptions.h"
@@ -33,7 +34,7 @@ struct task {
     uint64_t wake_tick;
     uint64_t fs_session, reply_session;
     unsigned reply_endpoint;
-    bool fs_broker, reply_control;
+    bool fs_broker, reply_control, native_loader;
 };
 static struct task tasks[TASKS];
 static uint8_t stacks[TASKS][16384] __attribute__((aligned(16)));
@@ -51,17 +52,26 @@ static struct desktop_launch_result *captured_output;
 static uint64_t launch_destination;
 static bool launch_pending;
 static bool pending_ai;
-static bool pending_native_start, pending_native_recovery;
+static bool pending_native_recovery;
+static const void *native_loader_code;
+static uint64_t native_loader_bytes;
+static uint8_t native_image[FS_FILE_LIMIT];
 static uint64_t next_identity = 1;
 static struct native_job_state {
     struct native_job_info info;
-    bool files, close_sent, close_acked;
-    uint64_t owner, peak_pages, cpu_ticks;
+    bool files, session_open, close_sent, close_acked, loader_released;
+    int load_error;
+    uint64_t owner, peak_pages, cpu_ticks, load_deadline;
 } native_job;
 static long native_control(struct task *, uint64_t op, uint64_t address, uint64_t bytes);
 static void advance_native_job(void);
 static void discard_native_job(void);
 static void start_native_job(void);
+static long loader_control(struct task *, uint64_t op, uint64_t address, uint64_t bytes);
+void process_native_loader_config(const void *file, uint64_t size) {
+    native_loader_code = file;
+    native_loader_bytes = size;
+}
 static struct ai_session desktop_ai;
 static struct task parked_server;
 static struct task parked_ai;
@@ -310,6 +320,26 @@ static void syscall(struct task *task) {
                 f->rax = (uint64_t)-14;
                 break;
             }
+            if (task->native_loader) {
+                const struct fs_message *q = (const struct fs_message *)m->data;
+                bool allowed = f->rdx == sizeof(*q) &&
+                    (q->op == FS_BEGIN || q->op == FS_ABORT || q->op == FS_STAT || q->op == FS_READ);
+                if (allowed && (q->op == FS_STAT || q->op == FS_READ))
+                    for (unsigned i = 0; i < sizeof(q->name); ++i)
+                        if (q->name[i] != launch_request.name[i])
+                            allowed = false;
+                if (!allowed) {
+                    f->rax = (uint64_t)-1;
+                    break;
+                }
+                native_job.loader_released = false;
+            }
+            if (fs_reply && native_job.info.state == NOS_JOB_LOADING &&
+                task->reply_session == native_job.info.id && f->rdx == sizeof(struct fs_message)) {
+                const struct fs_message *r = (const struct fs_message *)m->data;
+                if (r->op == FS_ABORT && !r->status)
+                    native_job.loader_released = true;
+            }
             m->size = f->rdx;
             ++ep->count;
             ++sent;
@@ -455,7 +485,7 @@ static void syscall(struct task *task) {
         launch_destination = f->rsi;
         launch_pending = true;
         pending_ai = false;
-        pending_native_start = pending_native_recovery = false;
+        pending_native_recovery = false;
         task->state = SUSPENDED;
         break;
     }
@@ -492,7 +522,7 @@ static void syscall(struct task *task) {
         launch_destination = f->rsi;
         launch_pending = true;
         pending_ai = true;
-        pending_native_start = pending_native_recovery = false;
+        pending_native_recovery = false;
         task->state = SUSPENDED;
         break;
     }
@@ -509,6 +539,9 @@ static void syscall(struct task *task) {
         break;
     case 20:
         f->rax = (uint64_t)native_control(task, f->rdi, f->rsi, f->rdx);
+        break;
+    case 22:
+        f->rax = (uint64_t)loader_control(task, f->rdi, f->rsi, f->rdx);
         break;
     case 21: {
         if (!task->desktop || current != 1) {
@@ -632,19 +665,29 @@ static void finish_native_job(void) {
     console_write("DESKTOP CHILD FINISHED\n");
 }
 static void advance_native_job(void) {
-    if (native_job.info.state == NOS_JOB_RUNNING && !task_alive(&tasks[4])) {
+    bool loading = native_job.info.state == NOS_JOB_LOADING;
+    if (loading && task_alive(&tasks[4]) && timer_ticks() >= native_job.load_deadline) {
+        native_job.load_error = -110;
+        tasks[4].state = EXITED;
+    }
+    if ((loading || native_job.info.state == NOS_JOB_RUNNING) && !task_alive(&tasks[4])) {
         struct desktop_launch_result *r = &native_job.info.result;
-        r->kind = tasks[4].state == EXITED      ? NOS_LAUNCH_EXITED
+        r->kind = tasks[4].state == CANCELLED ? NOS_LAUNCH_CANCELLED
+                  : loading                   ? NOS_LAUNCH_LOAD_ERROR
+                  : tasks[4].state == EXITED      ? NOS_LAUNCH_EXITED
                   : tasks[4].state == EXPIRED   ? NOS_LAUNCH_TIMED_OUT
-                  : tasks[4].state == CANCELLED ? NOS_LAUNCH_CANCELLED
                                                 : NOS_LAUNCH_FAULTED;
         r->exit_code = tasks[4].status;
         r->fault = (uint32_t)tasks[4].fault;
-        journal_job(r->kind == NOS_LAUNCH_EXITED      ? NOS_EVENT_EXITED
+        int load_error = tasks[4].state == FAULTED ? -14
+                         : tasks[4].state == EXPIRED ? -110 : native_job.load_error;
+        journal_job(r->kind == NOS_LAUNCH_LOAD_ERROR  ? NOS_EVENT_LOAD_FAILED
+                    : r->kind == NOS_LAUNCH_EXITED      ? NOS_EVENT_EXITED
                     : r->kind == NOS_LAUNCH_TIMED_OUT ? NOS_EVENT_TIMED_OUT
                     : r->kind == NOS_LAUNCH_CANCELLED ? NOS_EVENT_CANCELLED
                                                       : NOS_EVENT_FAULTED,
-                    r->kind == NOS_LAUNCH_EXITED ? r->exit_code : r->fault);
+                    r->kind == NOS_LAUNCH_LOAD_ERROR ? (uint64_t)(int64_t)load_error
+                    : r->kind == NOS_LAUNCH_EXITED ? r->exit_code : r->fault);
         if (r->kind == NOS_LAUNCH_EXITED) {
             console_write("EXIT CODE ");
             console_number(r->exit_code);
@@ -657,7 +700,7 @@ static void advance_native_job(void) {
         user_space_destroy(&tasks[4].space);
         tasks[4] = (struct task){.state = EXITED};
         native_job.info.state = NOS_JOB_CLOSING;
-        if (!native_job.files) {
+        if (!native_job.session_open) {
             finish_native_job();
             return;
         }
@@ -694,7 +737,7 @@ static void discard_native_job(void) {
         tasks[4] = (struct task){.state = EXITED};
         /* Parent death: discard an in-flight service session instead of
            replaying IO. The normal supervisor remounts committed roots. */
-        if (native_job.files)
+        if (native_job.session_open)
             tasks[0].ipc_idle = false;
     }
     native_job = (struct native_job_state){0};
@@ -727,14 +770,15 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
         if (!id)
             return -75;
         native_job.info = (struct native_job_info){
-            .id = id, .state = NOS_JOB_RUNNING, .result = {.kind = NOS_LAUNCH_LOAD_ERROR}};
+            .id = id, .state = NOS_JOB_LOADING, .result = {.kind = NOS_LAUNCH_LOAD_ERROR}};
         native_job.files = (launch_request.flags & NOS_LAUNCH_FILES) != 0;
+        native_job.session_open = true;
+        native_job.load_error = -5;
+        native_job.load_deadline = timer_ticks() + 6000; /* Bounded loading wall time. */
         native_job.owner = desktop->fs_session;
         journal_job(NOS_EVENT_REQUESTED, 0);
-        launch_pending = pending_native_start = true;
-        pending_ai = pending_native_recovery = false;
-        desktop->state = SUSPENDED;
-        return 0; /* Replaced with the job ID after loading on the kernel stack. */
+        start_native_job();
+        return (long)id; /* No FS IO or retained user pointers in this syscall. */
     }
     if (op == NOS_JOB_POLL) {
         uint64_t id;
@@ -749,7 +793,7 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
         if (native_job.info.state == NOS_JOB_CLOSING && !task_alive(&tasks[0])) {
             launch_destination = address;
             launch_pending = pending_native_recovery = true;
-            pending_ai = pending_native_start = false;
+            pending_ai = false;
             desktop->state = SUSPENDED;
             return 0;
         }
@@ -763,7 +807,8 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
         if (native_job.info.state == NOS_JOB_EMPTY || address != native_job.info.id)
             return -2;
         if (op == NOS_JOB_CANCEL) {
-            if (native_job.info.state != NOS_JOB_RUNNING || !task_alive(&tasks[4]))
+            if ((native_job.info.state != NOS_JOB_RUNNING && native_job.info.state != NOS_JOB_LOADING) ||
+                !task_alive(&tasks[4]))
                 return -16;
             journal_job(NOS_EVENT_CANCEL_REQUESTED, 0);
             tasks[4].state = CANCELLED;
@@ -778,23 +823,17 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
     return -22;
 }
 static void start_native_job(void) {
-    const void *file;
-    uint64_t size, entry;
+    uint64_t entry;
     tasks[4] = (struct task){0};
-    if (!filesystem_load(launch_request.name, &file, &size)) {
-        journal_job(NOS_EVENT_LOAD_FAILED, (uint64_t)-5);
-        finish_native_job();
-        return;
-    }
-    if (!user_space_elf(&tasks[4].space, file, size, &entry)) {
+    if (!native_loader_code || !user_space_elf(&tasks[4].space, native_loader_code, native_loader_bytes, &entry)) {
         journal_job(NOS_EVENT_LOAD_FAILED, (uint64_t)-8);
         finish_native_job();
         return;
     }
-    unsigned n = 0;
-    while (launch_request.arguments[n])
-        ++n;
-    if (!user_copy_to(&tasks[4].space, USER_STACK + 0x100, launch_request.arguments, n + 1)) {
+    struct nos_loader_request boot = {0};
+    for (unsigned i = 0; i < sizeof(boot.name); ++i)
+        boot.name[i] = launch_request.name[i];
+    if (!user_copy_to(&tasks[4].space, USER_STACK + 0x100, &boot, sizeof(boot))) {
         journal_job(NOS_EVENT_LOAD_FAILED, (uint64_t)-14);
         user_space_destroy(&tasks[4].space);
         finish_native_job();
@@ -808,12 +847,63 @@ static void start_native_job(void) {
                                             .rsp = USER_ELF_STACK_TOP - 16,
                                             .rdi = USER_STACK + 0x100};
     tasks[4].fs_session = native_job.info.id;
-    if (native_job.files) {
-        tasks[4].caps[1] = (struct capability){0, SEND};
-        tasks[4].caps[2] = (struct capability){4, RECEIVE};
+    tasks[4].native_loader = true;
+    tasks[4].caps[1] = (struct capability){0, SEND};
+    tasks[4].caps[2] = (struct capability){4, RECEIVE};
+    endpoints[4] = (struct endpoint){.owner = 4, .producer = 0, .session = native_job.info.id};
+    tasks[2] = tasks[3] = (struct task){.state = EXITED};
+    task_count = 5;
+    console_write("NATIVE JOB LOADING\n");
+}
+static long loader_control(struct task *task, uint64_t op, uint64_t address, uint64_t bytes) {
+    if (current != 4 || !task->native_loader || native_job.info.state != NOS_JOB_LOADING)
+        return -1;
+    if (op == NOS_LOADER_FAIL) {
+        int64_t error = (int64_t)address;
+        if (bytes || error >= 0 || error < -4095)
+            return -22;
+        native_job.load_error = (int)error;
+        task->state = EXITED;
+        return 0;
     }
+    if (op != NOS_LOADER_COMMIT || !bytes || bytes > sizeof(native_image))
+        return -22;
+    /* An unrelated client's request may be in flight after our ABORT reply.
+       Only this loader's released snapshot and drained reply route matter. */
+    if (!native_job.loader_released || endpoints[4].count)
+        return -16;
+    if (!user_copy_from(&task->space, native_image, address, (size_t)bytes))
+        return -14;
+    struct task next = {0};
+    uint64_t entry;
+    if (!user_space_elf(&next.space, native_image, (size_t)bytes, &entry))
+        return -8;
+    unsigned n = 0;
+    while (launch_request.arguments[n])
+        ++n;
+    if (!user_copy_to(&next.space, USER_STACK + 0x100, launch_request.arguments, n + 1)) {
+        user_space_destroy(&next.space);
+        return -14;
+    }
+    fpu_init(&next.fp);
+    next.context = (struct cpu_context){.rip = entry, .cs = 0x33, .ss = 0x2b, .flags = 0x202,
+        .rsp = USER_ELF_STACK_TOP - 16, .rdi = USER_STACK + 0x100};
+    next.fs_session = native_job.info.id;
+    if (native_job.files) {
+        next.caps[1] = (struct capability){0, SEND};
+        next.caps[2] = (struct capability){4, RECEIVE};
+    }
+    /* Current loader mappings must not be active while their pages are freed.
+       All image bytes were copied/validated before this atomic replacement. */
+    paging_switch(paging_kernel_root());
+    user_space_destroy(&task->space);
+    *task = next;
+    paging_switch(task->space.root);
+    native_job.session_open = native_job.files;
+    native_job.info.state = NOS_JOB_RUNNING;
     journal_job(NOS_EVENT_STARTED, 0);
     console_write("NATIVE JOB STARTED\n");
+    return 0;
 }
 struct cpu_context *process_trap(struct cpu_context *frame, uint64_t cr2) {
     if (frame->vector == 32)
@@ -1174,9 +1264,7 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
            runs as an ordinary task with only explicitly requested FS rights. */
         launch_pending = false;
         desktop_launch = false;
-        if (pending_native_start) {
-            start_native_job();
-        } else if (pending_native_recovery) {
+        if (pending_native_recovery) {
             native_job.info.cleanup_error = -5;
             journal_job(NOS_EVENT_FS_RECOVERING, 0);
             finish_native_job();
@@ -1196,9 +1284,7 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
         suspended_desktop = (struct task){0};
         tasks[1].state = READY;
         tasks[1].ticks = 0;
-        if (pending_native_start)
-            tasks[1].context.rax = native_job.info.id;
-        else if (pending_native_recovery)
+        if (pending_native_recovery)
             tasks[1].context.rax = 0; /* Result copied after service recovery below. */
         else
             tasks[1].context.rax =
@@ -1247,9 +1333,9 @@ bool process_run_file(const void *file, uint64_t size, const char *arguments, bo
             tasks[2] = tasks[3] = (struct task){.state = EXITED};
             endpoints[4] =
                 (struct endpoint){.owner = 4, .producer = 0, .session = native_job.info.id};
-        } else if (!pending_native_start && !pending_native_recovery)
+        } else if (!pending_native_recovery)
             console_write("DESKTOP CHILD FINISHED\n");
-        pending_native_start = pending_native_recovery = false;
+        pending_native_recovery = false;
     }
     ok = tasks[app].state == EXITED;
     if (tasks[app].desktop)

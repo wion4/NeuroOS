@@ -53,9 +53,12 @@ Sequence никогда не оборачивается: при UINT64_MAX но�
 | pages | Максимум owned-page count, наблюдённый после ELF load/изменения heap |
 
 Owned pages включают image/stack/page tables и heap. Не включают весь расход
-ядра или временные аллокации неудавшегося loader. CPU ticks — диагностический
+ядра или временные аллокации loader. CPU ticks — диагностический
 счётчик планировщика, не точный профайлер CPU/wall time. Фаза загрузки отражается
-во времени между Requested/Started, её RPC-помощники не начисляются ребёнку.
+во времени между Requested/Started; с 0.0.21 её отдельный loader не начисляется
+конечной программе. До Started её cpu_ticks/pages равны нулю. Ошибка loading
+может сопровождаться FS closed/rollback даже при выключенном launch file grant:
+временная read snapshot сессия тоже должна закрыться. См. [loader.md](loader.md).
 
 value: exit code для Exited, вектор для Fault, отрицательный errno в 64-битном
 представлении для Load failed/FS unavailable. Files closed: 1 означает rollback

@@ -301,7 +301,7 @@ static void save_note(bool overwrite) {
             return;
         }
         if (size != -2) {
-            message(size == -16 ? "Another program is writing. Your text is preserved; save later."
+            message(size == -16 ? "File service busy. Your text is preserved; save later."
                                 : "Could not check the destination. Nothing saved.");
             if (size == -16)
                 say("DESKTOP NOTE SAVE BUSY\n");
@@ -310,7 +310,7 @@ static void save_note(bool overwrite) {
     }
     long n = nos_file_write(filename, note, note_len);
     if (n != (long)note_len) {
-        message(n == -16 ? "Another program is writing. Your text is preserved; save later."
+        message(n == -16 ? "File service busy. Your text is preserved; save later."
                          : "Save failed. Your text is still in the editor.");
         if (n == -16)
             say("DESKTOP NOTE SAVE BUSY\n");
@@ -595,11 +595,11 @@ static void run_program(void) {
         return;
     }
     program_job = (uint64_t)e;
-    program_status = (struct native_job_info){.id = program_job, .state = NOS_JOB_RUNNING};
+    program_status = (struct native_job_info){.id = program_job, .state = NOS_JOB_LOADING};
     program_result = (struct desktop_launch_result){0};
     program_has_result = true;
     program_scroll = 0;
-    message("Program is running. You can keep working; Stop cancels it.");
+    message("Loading in background. You can keep editing; Stop cancels it.");
     say("DESKTOP PROGRAM STARTED\n");
 }
 static void program_poll(void) {
@@ -614,6 +614,8 @@ static void program_poll(void) {
     program_result = program_status.result;
     if (old_state != program_status.state || old_bytes != program_result.bytes)
         redraw = true;
+    if (old_state == NOS_JOB_LOADING && program_status.state == NOS_JOB_RUNNING)
+        message("Program is running. You can keep working; Stop cancels it.");
     if (program_status.state != NOS_JOB_FINISHED)
         return;
     if (call3(20, NOS_JOB_REAP, program_job, 0) < 0) {
@@ -721,6 +723,7 @@ static void draw_programs(struct window *w) {
         if (program_job)
             snprintf(status, sizeof(status),
                      program_status.state == NOS_JOB_CLOSING ? "Closing file session..."
+                     : program_status.state == NOS_JOB_LOADING ? "Loading / Stop to cancel"
                                                              : "Running / Stop to cancel");
         else if (program_result.kind == NOS_LAUNCH_EXITED)
             snprintf(status, sizeof(status), "Exit code %llu%s",

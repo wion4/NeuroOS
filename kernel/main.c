@@ -311,6 +311,13 @@ bool kernel_desktop(void) {
         console_write("DESKTOP UNAVAILABLE: DISPLAY OR MODULE\n");
         return false;
     }
+    /* Loader is appended after optional modules; do not shift their ABI slots. */
+    const void *loader;
+    uint64_t loader_bytes;
+    if (!modules.response || !modules.response->module_count ||
+        !kernel_boot_module((unsigned)modules.response->module_count - 1, &loader, &loader_bytes))
+        return false;
+    process_native_loader_config(loader, loader_bytes);
     graphics_active = true;
     console_write(mouse_init() ? "MOUSE READY\n" : "MOUSE UNAVAILABLE\n");
     bool ok = process_run_desktop(program, bytes);

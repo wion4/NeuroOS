@@ -102,7 +102,7 @@ def build(test=False, fault=0):
             module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
             if name=='ai_prepare':module.prepare(ROOT,target)
             else:module.build(ROOT,target)
-    apps=['ramfs','fsclient','filedemo','libcdemo','floatdemo','desktop']+(['fs3demo'] if fs3_test else [])+(['airuntime','aiclient'] if ai_demo else [])
+    apps=['ramfs','fsclient','filedemo','libcdemo','floatdemo','desktop','loader']+(['fs3demo'] if fs3_test else [])+(['airuntime','aiclient'] if ai_demo else [])
     for app in apps:
         installable=app in ('filedemo','libcdemo','floatdemo','fs3demo')
         app_objects=[]
@@ -113,6 +113,7 @@ def build(test=False, fault=0):
         if installable:sources+=['user/file.c','user/heap.c','user/stdio.c']
         if app=='desktop':sources+=['user/file.c','user/heap.c','user/format.c','user/string.c','user/stdio.c',
                                     'user/text.c','user/keyboard.c']
+        if app=='loader':sources+=['user/heap.c']
         if app=='airuntime':sources+=['user/ai_core.c','ports/llama2c/math.c','user/heap.c','user/stdio.c',
                                      'user/format.c','user/string.c','user/stdlib.c','user/file.c']
         if app=='filedemo':sources+=['tests/user_io.c']
@@ -190,6 +191,8 @@ def build(test=False, fault=0):
         with (esp/'limine.conf').open('a') as config:
             for name in ('airuntime.nos','aiclient.nos','ai.pack'):
                 config.write('    module_path: boot():/boot/'+name+'\n')
+    with (esp/'limine.conf').open('a') as config:
+        config.write('    module_path: boot():/boot/loader.nos\n')
     manifest = {
         'variant': variant,
         'filesystem_backend':backend,

@@ -23,7 +23,9 @@ def main():
     if '--desktop' in sys.argv:
         commands += [['tests/test_text.py'],['tests/test_desktop.py'],['tests/test_desktop_workflow.py'],
                      ['tests/test_job_control.py'],['tests/test_native_background.py'],
-                     ['tests/test_native_recovery.py'],['tests/test_event_desktop.py']]
+                     ['tests/test_native_recovery.py'],['tests/test_event_desktop.py'],
+                     ['tests/test_loader.py'],['tests/test_loader_failure.py'],
+                     ['tests/test_loader_busy.py']]
     if '--ai' in sys.argv:
         commands += [['tests/test_ai_guest.py'],['tests/test_ai_desktop.py'],['tests/test_ai_background.py'],
                      ['tests/test_build_variants.py']]

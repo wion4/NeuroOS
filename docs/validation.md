@@ -1,5 +1,54 @@
 # Проверки NeuroOS
 
+## 2026-11-04 — v0.0.21: фоновый пользовательский loader
+
+Новая фаза LOADING, private boot loader.nos, read snapshot и обязательная kernel
+ELF validation описаны в [loader.md](loader.md). Во время чтения executable
+desktop продолжает принимать ввод; Stop закрывает фазу loading, heap и сессию.
+После замены image приложение не имеет loader role и получает лишь launch grant.
+
+test_loader.py: настоящий executable размером 1 МиБ на тестовом FS3-диске.
+Реальные QMP/PS2-события изменяют заметку до Started. Save возвращает busy без
+потери текста; Stop закрывает snapshot, повторный Save сохраняет точные байты.
+Полное чтение/запуск того же файла даёт exit42. Private boot probe включает
+production loader и проверяет запреты записи/других имён/ATA/display/controller,
+неверные op/errno/размер, kernel/cross-page источник и invalid ELF. Закрытие
+owner до следующего Started отзывает loader даже при launch flags=0. PMM точный.
+
+test_loader_failure.py: настоящий #PF loader с открытым snapshot, естественное
+ожидание wall deadline 6000 ticks и настоящий #PF FS после 100 PIO words во
+время loading. Ring-3 controller получает Load error с точными событиями -14,
+-110/-32 и rollback/recovery; Started отсутствует, последующая запись успешна.
+Исходные файлы прежние, user mappings освобождены; неподтверждённые IO не повторяются.
+
+test_loader_busy.py: настоящий FS3 backend/storage, тестовый wrapper задерживает
+ответ чужого STAT. Загрузчик завершает свой snapshot и COMMIT во время этого
+запроса; serial показывает Started между Busy/Done, результат exit42. Сценарий
+воспроизводил ложный отказ при прежней общей idle-проверке; после исправления
+прошёл. Никакие дисковые операции не подменены, файлы и PMM прежние.
+
+Обновлённый test_job_control также проверяет Loader role denial даже для controller,
+missing.nos (-2) и чужую транзакцию (-16). Неуспешный loader закрывает только свой
+сеанс; snapshot desktop остаётся его владельцу до собственного ABORT. Предыдущие
+exit/fault/CPU1000, права, private draft, независимые FS replies, journal продолжают
+проверяться на настоящих ring-3 задачах, без модели/сети и рабочего диска VMware.
+
+Итоговый check-release --desktop — PASS всех 24 этапов без AI. Дополнительно
+прошёл job_control с legacy FS2. На копии 25 реальных файлов старый compiler.nos
+SHA-256 51925f635186ad83cbfc09958e33200c3a33fddb22806cf6abcab1e98e0a7a65
+с прежними headers/libnos.a скомпилировал C с puts; результат через новый loader
+вернул 37. Исходные 25 файлов не менялись, два файла добавлены только в sandbox.
+Отчёты: build/release-validation/result.json, build/vmware-compat-0.0.21/result.json.
+
+Рабочий ISO 0.0.21 без AI, 4,114,432 байт, загружен в VMware: STARTUP SELFTEST
+PASS, FS3, SDK, MOUSE READY, DESKTOP READY. Все 9 user ELF LOAD payloads,
+process.o/journal.o совпали с проверенным normal-desktop, boot compiler.nos —
+также с обычным normal. Все 25 файлов и весь data-flat.vmdk побайтово равны
+SHA-проверенной копии before-0.0.21-20261104-134713; старый ISO 0.0.20 сохранён.
+Интерактивные сценарии пройдены в QEMU, в VMware проверены загрузка тех же
+payloads и данные. Отчёт: build/vmware-0.0.21-validation.json. SHA-256 ISO:
+460d70eba035dd11e5e0fb4d3f20b66f9162a124886451510808a33c76a8d299.
+
 ## 2026-11-04 — v0.0.20: журнал native jobs и GUI observer
 
 Полный check-release --desktop из 21 этапа — PASS без AI. Включает host C

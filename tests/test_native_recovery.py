@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import neuro
 from desktop_guest import DesktopGuest
+from guest_debug import packet
 from native_fixture import seed_native_disk
 from test_compiler import snapshot_files
 
@@ -37,35 +38,6 @@ with socket.socket() as probe:
 original = neuro.qemu_command
 neuro.qemu_command = lambda *args, **kwargs: original(*args, **kwargs) + ['-gdb', f'tcp:127.0.0.1:{port}']
 
-def packet(connection, text):
-    def exact(count):
-        data = bytearray()
-        while len(data) < count:
-            part = connection.recv(count - len(data))
-            if not part: raise RuntimeError('GDB disconnected')
-            data += part
-        return bytes(data)
-    payload = text.encode()
-    connection.sendall(b'$' + payload + b'#' + f'{sum(payload) & 255:02x}'.encode())
-    while exact(1) != b'$':
-        pass
-    reply = bytearray()
-    while True:
-        part = exact(1)
-        if part == b'#': break
-        if not part: raise RuntimeError('GDB disconnected')
-        reply += part
-    checksum = exact(2)
-    assert len(checksum) == 2 and sum(reply) & 255 == int(checksum, 16)
-    connection.sendall(b'+')
-    # RSP may encode repeated bytes with '*' followed by count + 29.
-    decoded = bytearray(); index = 0
-    while index < len(reply):
-        if reply[index] == 42:
-            decoded.extend(bytes([decoded[-1]]) * (reply[index + 1] - 29)); index += 2
-        else:
-            decoded.append(reply[index]); index += 1
-    return bytes(decoded)
 
 def pages(data):
     return int(re.search(rb'PAGES FREE (\d+)', data)[1])
