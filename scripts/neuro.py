@@ -85,7 +85,7 @@ def build(test=False, fault=0):
     objects = []
     for source in ['main.c', 'memory.c', 'exceptions.c', 'entry.S', 'runtime.c',
                    'alloc.c', 'paging.c', 'devices.c', 'timer.S', 'shell.c',
-                   'process.c', 'user_program.S','elf.c','files.c','editor.c','fpu.c','sdk.c','display.c',
+                   'process.c', 'user_program.S','elf.c','files.c','editor.c','fpu.c','sdk.c','display.c','fs_policy.c',
                    'journal.c']:
         obj = target / (Path(source).stem + '.o')
         subprocess.run([clang, *flags, '-c', 'kernel/' + source, '-o', str(obj)],
@@ -112,7 +112,7 @@ def build(test=False, fault=0):
             sources.remove('user/ramfs.c');sources+=['user/ramfs3.c','user/fs3.c']
         if installable:sources+=['user/file.c','user/heap.c','user/stdio.c']
         if app=='desktop':sources+=['user/file.c','user/heap.c','user/format.c','user/string.c','user/stdio.c',
-                                    'user/text.c','user/keyboard.c']
+                                    'user/text.c','user/keyboard.c','kernel/fs_policy.c']
         if app=='loader':sources+=['user/heap.c']
         if app=='airuntime':sources+=['user/ai_core.c','ports/llama2c/math.c','user/heap.c','user/stdio.c',
                                      'user/format.c','user/string.c','user/stdlib.c','user/file.c']

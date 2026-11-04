@@ -1,6 +1,7 @@
 /* A native, user-space desktop. Tools share this process in the first preview. */
 #include "desktop.h"
 #include "../kernel/version.h"
+#include "../kernel/fs_policy.h"
 #include "abi.h"
 #include "ai.h"
 #include "cyrillic.h"
@@ -20,10 +21,10 @@
 #define INK 0xe5edf4u
 #define MUTED 0x93a6b8u
 #define EDGE 0x2c4052u
-enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, AI, EVENTS, APP_COUNT };
+enum { HOME, FILES, NOTES, CALC, APPEARANCE, PROGRAMS, AI, EVENTS, ACCESS, APP_COUNT };
 static const char *titles[] = {"Welcome",    "Files",    "Notes",        "Calculator",
-                               "Appearance", "Programs", "AI text demo", "Task events"};
-static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps", "AI", "Events"};
+                               "Appearance", "Programs", "AI text demo", "Task events", "File permissions"};
+static const char *labels[] = {"Home", "Files", "Notes", "Calc", "Style", "Apps", "AI", "Events", "Access"};
 struct window {
     int x, y, w, h;
     bool open;
@@ -31,8 +32,9 @@ struct window {
 static struct window windows[APP_COUNT] = {{132, 78, 620, 420, true},   {130, 78, 620, 430, false},
                                            {150, 90, 600, 420, false},  {340, 85, 365, 425, false},
                                            {220, 110, 490, 365, false}, {140, 85, 620, 425, false},
-                                           {136, 85, 620, 430, false},  {150, 95, 610, 400, false}};
-static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7}, active;
+                                           {136, 85, 620, 430, false},  {150, 95, 610, 400, false},
+                                           {138, 96, 620, 390, false}};
+static int order[APP_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7, 8}, active;
 static uint32_t *pixels, accent = 0x51e1ae;
 static const uint32_t accents[] = {0x51e1ae, 0x6baeff, 0xc09aff, 0xffbf69};
 static unsigned theme;
@@ -68,6 +70,9 @@ static int dialog;
 static char pending_name[16];
 static char program_name[16] = "hello.nos", program_arguments[80];
 static bool program_files, program_arguments_focus = true, program_has_result;
+static bool program_scoped;
+static struct nos_file_scope program_scope, access_draft;
+static unsigned access_row;
 static unsigned program_scroll;
 static struct desktop_launch_result program_result;
 static uint64_t program_job;
@@ -529,6 +534,116 @@ static bool program_settings_locked(void) {
     say("DESKTOP JOB SETTINGS LOCKED\n");
     return true;
 }
+static void access_open(void) {
+    if (program_settings_locked())
+        return;
+    access_draft = program_scoped ? program_scope : (struct nos_file_scope){0};
+    access_row = 0;
+    front(ACCESS);
+    message("Exact filenames. R: read, W: write, C: create, D: delete. Apply before Run.");
+}
+static void access_action(unsigned action) {
+    if (program_settings_locked())
+        return;
+    if (action == 0) {
+        struct nos_file_scope scope = {0};
+        for (unsigned i = 0; i < NOS_FILE_GRANTS; ++i)
+            if (access_draft.grants[i].name[0])
+                scope.grants[scope.count++] = access_draft.grants[i];
+        if (!fs_scope_valid(&scope)) {
+            say("DESKTOP FILE SCOPE REJECTED\n");
+            message("Use 1-4 different filenames and at least one right for each. Names: ASCII, 15 max.");
+            return;
+        }
+        program_scope = scope;
+        program_scoped = program_files = true;
+        say("DESKTOP FILE SCOPE APPLIED\n");
+        message("Exact file scope selected. Run starts with these rights.");
+    } else if (action == 1) {
+        program_scoped = false;
+        program_files = true;
+        message("Full file access selected for the next Run.");
+    } else if (action == 2) {
+        program_scoped = program_files = false;
+        message("File access is off for the next Run.");
+    }
+    windows[ACCESS].open = false;
+    front(PROGRAMS);
+}
+static void access_key(uint32_t key) {
+    if (key == 27) {
+        windows[ACCESS].open = false;
+        front(PROGRAMS);
+        return;
+    }
+    if (program_settings_locked())
+        return;
+    if (key == '\n') {
+        access_action(0);
+        return;
+    }
+    if (key == '\t' || key == KEY_DOWN || key == KEY_UP) {
+        access_row = (access_row + (key == KEY_UP || (input.modifiers & INPUT_SHIFT) ? 3 : 1)) % 4;
+    } else if (!(input.modifiers & (INPUT_CONTROL | INPUT_ALT))) {
+        struct nos_file_grant *g = &access_draft.grants[access_row];
+        size_t n = strlen(g->name);
+        if (key == '\b' && n)
+            g->name[n - 1] = 0;
+        else if (n < 15 && ((key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z') ||
+                           (key >= '0' && key <= '9') || key == '.' || key == '_' || key == '-')) {
+            g->name[n] = (char)key;
+            g->name[n + 1] = 0;
+            if (!g->rights)
+                g->rights = NOS_FILE_READ;
+        }
+    }
+    redraw = true;
+}
+static void draw_access(struct window *w) {
+    int x = w->x + 24, y = w->y + 78;
+    char heading[64];
+    snprintf(heading, sizeof(heading), "Program: %s", program_name);
+    text(x, w->y + 47, heading, 1, INK);
+    text(x, y - 15, "Exact filename", 1, MUTED);
+    const char *rights[] = {"Read", "Write", "Create", "Delete"};
+    for (unsigned bit = 0; bit < 4; ++bit)
+        text(w->x + 280 + (int)bit * 66, y - 15, rights[bit], 1, MUTED);
+    for (unsigned row = 0; row < 4; ++row) {
+        int top = y + (int)row * 49;
+        const struct nos_file_grant *g = &access_draft.grants[row];
+        rect(x, top, 238, 28, row == access_row ? EDGE : BG);
+        text(x + 8, top + 10, g->name, 1, INK);
+        if (row == access_row && !program_job)
+            rect(x + 8 + (int)strlen(g->name) * 6, top + 7, 1, 14, accent);
+        for (unsigned bit = 0; bit < 4; ++bit)
+            button(w->x + 280 + (int)bit * 66, top, 54,
+                   g->rights & (1u << bit) ? "[x]" : "[ ]", false);
+    }
+    text(x, w->y + 283, program_job ? "Launch settings are fixed while the program runs."
+                                  : "Empty rows are skipped. No directories or wildcard grants.", 1, MUTED);
+    const char *actions[] = {"Apply scope", "Full FS", "No files", "Back"};
+    for (unsigned i = 0; i < 4; ++i)
+        button(x + (int)i * 138, w->y + 310, 126, actions[i], i == 0);
+    text(x, w->y + 355, "Rights apply at Run. Stop closes the whole job; no live partial revoke.", 1, MUTED);
+}
+static void access_click(struct window *w) {
+    if (program_settings_locked())
+        return;
+    for (unsigned row = 0; row < 4; ++row) {
+        int y = w->y + 78 + (int)row * 49;
+        if (inside(w->x + 24, y, 238, 28))
+            access_row = row;
+        for (unsigned bit = 0; bit < 4; ++bit)
+            if (inside(w->x + 280 + (int)bit * 66, y, 54, 28)) {
+                access_row = row;
+                access_draft.grants[row].rights ^= 1u << bit;
+            }
+    }
+    for (unsigned i = 0; i < 4; ++i)
+        if (inside(w->x + 24 + (int)i * 138, w->y + 310, 126, 28))
+            access_action(i);
+    redraw = true;
+}
 static void open_file(const char *name) {
     if (program_suffix(name)) {
         if (program_settings_locked()) {
@@ -538,6 +653,7 @@ static void open_file(const char *name) {
         snprintf(program_name, sizeof(program_name), "%s", name);
         program_arguments[0] = 0;
         program_files = false;
+        program_scoped = false;
         program_arguments_focus = true;
         program_has_result = false;
         program_scroll = 0;
@@ -562,6 +678,7 @@ static void build_source(const char *name) {
     snprintf(program_name, sizeof(program_name), "compiler.nos");
     snprintf(program_arguments, sizeof(program_arguments), "%s %s", name, output);
     program_files = false;
+    program_scoped = false;
     program_arguments_focus = true;
     program_has_result = false;
     front(PROGRAMS);
@@ -589,7 +706,13 @@ static void run_program(void) {
     program_has_result = false;
     message("Loading native program...");
     paint();
-    long e = call3(20, NOS_JOB_START, (uintptr_t)&q, sizeof(q));
+    long e;
+    if (program_files && program_scoped) {
+        q.flags = 0;
+        struct nos_scoped_launch scoped = {.launch = q, .files = program_scope};
+        e = call3(20, NOS_JOB_START_SCOPED, (uintptr_t)&scoped, sizeof(scoped));
+    } else
+        e = call3(20, NOS_JOB_START, (uintptr_t)&q, sizeof(q));
     if (e < 0) {
         message("Program could not start. File service unavailable or request rejected.");
         return;
@@ -660,7 +783,7 @@ static void program_key(uint32_t key) {
     unsigned length = (unsigned)strlen(field), limit = program_arguments_focus ? 79 : 15;
     if (!program_arguments_focus &&
         ((key == '\b' && length) || (key >= 32 && key <= 126 && length < limit)))
-        program_files = false;
+        program_files = program_scoped = false;
     if (key == '\b' && length)
         field[length - 1] = 0;
     else if (key >= 32 && key <= 126 && length < limit) {
@@ -689,7 +812,10 @@ static void draw_programs(struct window *w) {
     text(x + 47, y + 10, program_name, 1, INK);
     button(x + 237, y, 80, program_job ? "Stop" : "Run", true);
     button(x + 330, y, 245,
-           program_job
+           program_scoped
+               ? (program_files ? (program_job ? "Exact file scope (fixed)" : "[x] Exact file scope")
+                                : (program_job ? "Exact file scope: off (fixed)" : "[ ] Exact file scope"))
+               : program_job
                ? (program_files ? "File access: allowed (fixed)" : "File access: off (fixed)")
                : (program_files ? "[x] Allow file access" : "[ ] Allow file access"),
            false);
@@ -833,7 +959,7 @@ static void draw_events(struct window *w) {
         snprintf(name, sizeof(name), "%s%s", event_name(event->kind),
                  (event->kind == NOS_EVENT_REQUESTED || event->kind == NOS_EVENT_STARTED) &&
                          (event->flags & NOS_LAUNCH_FILES)
-                     ? " +files"
+                     ? (event->flags & NOS_EVENT_SCOPED_FILES ? " +scope" : " +files")
                      : "");
         text(x + 140, top, name, 1, INK);
         event_number(x + 290, top, event->value, 20,
@@ -1176,8 +1302,10 @@ static void paint(void) {
         text(w->x + 15, w->y + 14, titles[id], 1, INK);
         if (id == NOTES)
             button(w->x + w->w - 76, w->y + 4, 30, note_maximized ? "-" : "+", false);
-        if (id == PROGRAMS)
+        if (id == PROGRAMS) {
+            button(w->x + w->w - 235, w->y + 4, 86, "Access", false);
             button(w->x + w->w - 140, w->y + 4, 95, "Events", false);
+        }
         button(w->x + w->w - 38, w->y + 4, 30, "x", false);
         if (id == HOME)
             draw_home(w);
@@ -1195,6 +1323,8 @@ static void paint(void) {
             draw_ai(w);
         if (id == EVENTS)
             draw_events(w);
+        if (id == ACCESS)
+            draw_access(w);
     }
     rect(0, 533, W, 67, 0x111e2b);
     line(0, 533, W, EDGE);
@@ -1289,6 +1419,10 @@ static void click(void) {
             front(EVENTS);
             return;
         }
+        if (id == PROGRAMS && inside(w->x + w->w - 235, w->y + 4, 86, 28)) {
+            access_open();
+            return;
+        }
         if (input.y < w->y + 35) {
             if (id == NOTES && note_maximized)
                 return;
@@ -1378,6 +1512,8 @@ static void click(void) {
                 if (program_scroll > limit)
                     program_scroll = limit;
             }
+        } else if (id == ACCESS) {
+            access_click(w);
         } else if (id == EVENTS) {
             if (inside(x, w->y + w->h - 40, 94, 28)) {
                 event_offset = 0;
@@ -1501,6 +1637,8 @@ int user_main(void) {
                 note_key(key);
             else if (windows[active].open && active == EVENTS)
                 events_key(key);
+            else if (windows[active].open && active == ACCESS)
+                access_key(key);
             else if (windows[active].open && active == AI)
                 ai_key(key);
             else if (windows[active].open && active == PROGRAMS)

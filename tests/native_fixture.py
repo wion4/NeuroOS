@@ -4,7 +4,7 @@ import struct
 import zlib
 ROOT = Path(__file__).resolve().parents[1]
 
-def seed_native_disk(disk, target):
+def seed_native_disk(disk, target, extra=None):
     disk = disk.resolve()
     assert disk.is_relative_to(ROOT / 'build') and disk.name.endswith('-test-only.img')
     hello = (target / 'esp/boot/hello.nos').read_bytes()
@@ -12,6 +12,10 @@ def seed_native_disk(disk, target):
     files = {'hello.nos': hello, 'spin.nos': bytes(spin),
              'filedemo.nos': (target / 'esp/boot/filedemo.nos').read_bytes(),
              'sentinel.txt': b'seed', 'bogus.nos': b'not an ELF'}
+    if extra:
+        assert not set(extra).intersection(files)
+        files.update(extra)
+    assert len(files) <= 8
     payload = bytearray(131264)
     for index, (name, data) in enumerate(files.items()):
         assert len(data) <= 16384

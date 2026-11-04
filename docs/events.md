@@ -47,7 +47,7 @@ Sequence никогда не оборачивается: при UINT64_MAX но�
 | job | Непрозрачный native job ID |
 | owner | Логическая сессия controller, не PID и не имя пользователя |
 | kind | Тип, существующие номера закреплены за format 1 |
-| flags | Snapshot launch permissions; сейчас NOS_EVENT_FILES |
+| flags | Snapshot launch permissions: FILES=1, с 0.0.22 SCOPED_FILES=2 |
 | value | Типизированный результат, описан ниже |
 | cpu_ticks | Число начисленных ребёнку user timer ticks |
 | pages | Максимум owned-page count, наблюдённый после ELF load/изменения heap |

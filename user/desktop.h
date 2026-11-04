@@ -1,6 +1,7 @@
 #ifndef NEUROOS_DESKTOP_ABI_H
 #define NEUROOS_DESKTOP_ABI_H
 #include <stdint.h>
+#include "fs_scope.h"
 #define DESKTOP_WIDTH 800u
 #define DESKTOP_HEIGHT 600u
 #define INPUT_SHIFT 1u
@@ -38,6 +39,12 @@ struct desktop_launch_result {
 #define NOS_JOB_POLL 1u
 #define NOS_JOB_CANCEL 2u
 #define NOS_JOB_REAP 3u
+#define NOS_JOB_START_SCOPED 4u
+struct nos_scoped_launch {
+    struct desktop_launch_request launch; /* flags must be zero: no broad grant. */
+    struct nos_file_scope files;
+};
+_Static_assert(sizeof(struct nos_scoped_launch) == 188, "Scoped launch ABI");
 enum { NOS_JOB_EMPTY, NOS_JOB_RUNNING, NOS_JOB_CLOSING, NOS_JOB_FINISHED, NOS_JOB_LOADING };
 struct native_job_info {
     uint64_t id;

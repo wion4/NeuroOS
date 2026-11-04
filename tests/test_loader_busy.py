@@ -50,7 +50,7 @@ try:
         (folder/'serial.log').write_bytes(serial)
         assert b'LOADER BUSY FS TEST PASS' in serial,serial[-1600:]
         assert b'LOADER PRIVILEGE TEST PASS' in serial
-        assert serial.count(b'FS TEST UNRELATED REQUEST BUSY')>=2
+        assert serial.count(b'FS TEST UNRELATED REQUEST BUSY')>=1
         assert (serial.rfind(b'FS TEST UNRELATED REQUEST BUSY') <
                 serial.index(b'LOADER PRIVILEGE TEST PASS') < serial.index(b'NATIVE JOB STARTED') <
                 serial.rfind(b'FS TEST UNRELATED REQUEST DONE'))

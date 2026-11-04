@@ -1,4 +1,4 @@
-# Нативные фоновые задачи — 0.0.21
+# Нативные фоновые задачи — 0.0.22
 
 ![Редактирование при работающей обычной .nos](images/native-background.png)
 
@@ -30,6 +30,12 @@ display/input, ATA и model-read права. Форматы — user/desktop.h.
 | POLL=1 | Writable native_job_info, 2088 байт, входной id | Текущее состояние, вывод и результат; 0 при успехе |
 | CANCEL=2 | ID, размер 0 | Запрос остановки живой задачи; 0 при успехе |
 | REAP=3 | ID, размер 0 | Освобождение FINISHED handle; живой job даёт busy |
+| START_SCOPED=4 | 188-byte nos_scoped_launch, flags0 и список до 4 имён/прав | Запуск с правами только на эти имена и операции |
+
+Прежний START и broad NOS_LAUNCH_FILES сохранены. Scope — snapshot до завершения,
+приложение не наследует private loader role. Programs → Access задаёт отдельные
+Read/Write/Create/Delete. Подробности, SDK compatibility и границы —
+[file-permissions.md](file-permissions.md).
 
 Идентификатор монотонный, не переиспользуется в течение загрузки. Исчерпание
 диапазона возвращает ошибку вместо wraparound. Старый handle не управляет новой

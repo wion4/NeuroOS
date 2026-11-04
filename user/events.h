@@ -6,6 +6,7 @@
 #define NOS_EVENT_RETAINED 64u
 #define NOS_EVENT_EXHAUSTED 1u
 #define NOS_EVENT_FILES 1u
+#define NOS_EVENT_SCOPED_FILES 2u
 /* Append new kinds; existing numeric values belong to format version 1. */
 enum {
     NOS_EVENT_REQUESTED = 1,

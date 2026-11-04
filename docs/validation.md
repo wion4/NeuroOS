@@ -1,5 +1,59 @@
 # Проверки NeuroOS
 
+## 2026-11-04 — v0.0.22: права по именам и операциям
+
+Контракт — [file-permissions.md](file-permissions.md). START_SCOPED(4) копирует
+188-byte request с четырьмя grants; Kernel проверяет каждый запрос до FS queue.
+Полномочия, источник executable и sender/session не определяются payload клиента.
+Read/Write/Create/Delete проверяются отдельно для каждого имени. Старые START,
+SDK и 64-byte файловый протокол сохранены.
+
+test_fs_policy.py: 8 тестов настоящего C — границы ABI, count/reserved/unused,
+нули после имени, 15-byte limit/ASCII/case/дубликаты, все комбинации прав, чужие
+имена, read snapshot без mutating commit, LIST/QUIT/client-close denial и private
+loader. Compatibility probe требует Write, не выдаёт Create/Read и не расширяет имена.
+
+test_scoped_files.py: настоящий ring3 controller/обычные .nos, malformed source
+и grants, snapshot аргументов/политики, source image не наследует read-доступ.
+Read-only, Write-only существующего, Create-only, Delete-only и четыре разных
+grants проверены отдельно; чужие операции/короткие сообщения не попадают в FS.
+Разрешённые изменения проверены и восстановлены. Stop откатывает scoped draft;
+исходные файлы побайтово прежние, PMM точный. Тот же сценарий выполнен с FS2.
+
+Старая CREATE/TRUNCATE/WRITE/COMMIT последовательность проверена без изменения
+SDK: kernel делает только STAT выданного имени и возвращает EEXIST, op CREATE,
+size/offset/data0. Для отсутствующего Write-only имени создания не происходит.
+Private metadata нельзя подделать полями запроса. Тест проверяет и ответ, и диск.
+
+test_scope_desktop.py: реальные QMP/PS2 действия в Access, дубликаты отклонены,
+Read допускает чтение и отклоняет WRITE, изменение args не расширяет права.
+Write-only даёт запись существующего, Events показывает +scope. Пока job жив,
+настройки фиксированы; Stop откатывает draft, другой executable очищает grants.
+Заметка/посторонние файлы и PMM проверены независимо. Ни модели, ни рабочий диск
+VMware не использовались. Рабочий ISO обновляется только после итоговых проверок.
+
+Итог: PASS всех 27 этапов check-release --desktop. После пользовательского
+прерывания продолжены только оставшиеся этапы на том же коде. Также PASS подробного
+test_compiler.py: C/ASM, ошибки сохраняют output, temp collision, холодная загрузка,
+повторная/воспроизводимая компиляция и установленный compiler. Legacy FS2 scoped
+test повторно прошёл с окончательным неизменённым file.c/SDK.
+
+На копии 25 реальных файлов прежний compiler.nos с SHA-256
+51925f635186ad83cbfc09958e33200c3a33fddb22806cf6abcab1e98e0a7a65 и старым SDK
+скомпилировал C с puts (exit37) и отдельный writer. Writer под единственным
+Write grant, без Read/Create, обновил compat22.txt до точных байтов owned и
+вернул37. Исходные 25 файлов прежние; все пять новых файлов только в sandbox.
+Отчёт: build/vmware-compat-0.0.22/result.json. SDK не заменялся.
+
+ISO 0.0.22 без AI, 4,143,104 байта, загружен в VMware: STARTUP SELFTEST PASS,
+FS3, SDK, MOUSE READY, DESKTOP READY. Все 9 user LOAD payloads и process.o,
+journal.o/fs_policy.o побайтово совпали с проверенным normal-desktop; compiler.nos
+совпал также с normal. Все 25 файлов и весь data-flat.vmdk равны SHA-проверенной
+копии before-0.0.22-20261104-182720; старый ISO0.0.21 сохранён. Интерактивные
+сценарии выполнены в QEMU, VMware подтвердил загрузку тех же payloads и данные.
+Отчёт: build/vmware-0.0.22-validation.json. SHA-256 ISO:
+c464c0bbba557deec29ed22315fd156524e7c70a6e036026cf630c49a0c223e0.
+
 ## 2026-11-04 — v0.0.21: фоновый пользовательский loader
 
 Новая фаза LOADING, private boot loader.nos, read snapshot и обязательная kernel

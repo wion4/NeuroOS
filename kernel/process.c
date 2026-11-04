@@ -7,6 +7,7 @@
 #include "display.h"
 #include "exceptions.h"
 #include "fpu.h"
+#include "fs_policy.h"
 #include "io.h"
 #include "journal.h"
 #include "paging.h"
@@ -34,7 +35,8 @@ struct task {
     uint64_t wake_tick;
     uint64_t fs_session, reply_session;
     unsigned reply_endpoint;
-    bool fs_broker, reply_control, native_loader;
+    bool fs_broker, reply_control, native_loader, fs_scoped, reply_create_probe;
+    struct nos_file_scope fs_scope;
 };
 static struct task tasks[TASKS];
 static uint8_t stacks[TASKS][16384] __attribute__((aligned(16)));
@@ -59,7 +61,8 @@ static uint8_t native_image[FS_FILE_LIMIT];
 static uint64_t next_identity = 1;
 static struct native_job_state {
     struct native_job_info info;
-    bool files, session_open, close_sent, close_acked, loader_released;
+    bool files, scoped, session_open, close_sent, close_acked, loader_released;
+    struct nos_file_scope scope;
     int load_error;
     uint64_t owner, peak_pages, cpu_ticks, load_deadline;
 } native_job;
@@ -97,7 +100,7 @@ struct message {
     uint64_t size, sender;
     uint64_t reply_session;
     unsigned reply_endpoint;
-    bool control;
+    bool control, create_probe;
 };
 struct endpoint {
     struct message queue[8];
@@ -136,7 +139,8 @@ static void journal_job(unsigned kind, uint64_t value) {
                               .job = native_job.info.id,
                               .owner = native_job.owner,
                               .kind = kind,
-                              .flags = native_job.files ? NOS_EVENT_FILES : 0,
+                              .flags = (native_job.files ? NOS_EVENT_FILES : 0) |
+                                       (native_job.scoped ? NOS_EVENT_SCOPED_FILES : 0),
                               .value = value,
                               .cpu_ticks = native_job.cpu_ticks,
                               .pages = native_job.peak_pages};
@@ -279,6 +283,7 @@ static void syscall(struct task *task) {
                     journal_job(NOS_EVENT_FS_CLOSED, reply.size);
                 }
                 task->ipc_idle = true;
+                task->reply_create_probe = false;
                 break; /* Kernel notification ack or a dead client's obsolete reply. */
             }
             if (fs_reply) {
@@ -322,17 +327,41 @@ static void syscall(struct task *task) {
             }
             if (task->native_loader) {
                 const struct fs_message *q = (const struct fs_message *)m->data;
-                bool allowed = f->rdx == sizeof(*q) &&
-                    (q->op == FS_BEGIN || q->op == FS_ABORT || q->op == FS_STAT || q->op == FS_READ);
-                if (allowed && (q->op == FS_STAT || q->op == FS_READ))
-                    for (unsigned i = 0; i < sizeof(q->name); ++i)
-                        if (q->name[i] != launch_request.name[i])
-                            allowed = false;
-                if (!allowed) {
+                if (f->rdx != sizeof(*q) || !fs_loader_allows(launch_request.name, q)) {
                     f->rax = (uint64_t)-1;
                     break;
                 }
                 native_job.loader_released = false;
+            }
+            if (task->fs_scoped) {
+                struct fs_message *q = (struct fs_message *)m->data;
+                if (f->rdx != sizeof(*q)) {
+                    f->rax = (uint64_t)-1;
+                    break;
+                }
+                if (!fs_scope_allows(&task->fs_scope, q)) {
+                    if (!fs_scope_create_probe(&task->fs_scope, q)) {
+                        f->rax = (uint64_t)-1;
+                        break; /* Denied before queueing or contacting the service. */
+                    }
+                    /* Older C helpers issue CREATE even for an existing file.
+                       WRITE grants permit only a nonmutating existence probe;
+                       never send their unauthorized CREATE to the backend. */
+                    q->op = FS_STAT;
+                    m->create_probe = true;
+                }
+            }
+            if (fs_reply && task->reply_create_probe) {
+                struct fs_message *r = (struct fs_message *)m->data;
+                if (f->rdx != sizeof(*r) || r->op != FS_STAT) {
+                    f->rax = (uint64_t)-22;
+                    break;
+                }
+                struct fs_message reply = {.op = FS_CREATE,
+                    .status = r->status == 0 ? -17 : r->status == -2 ? -1 : r->status};
+                for (unsigned i = 0; i < sizeof(reply.name); ++i)
+                    reply.name[i] = r->name[i];
+                *r = reply; /* No size, offset or data exposed by the probe. */
             }
             if (fs_reply && native_job.info.state == NOS_JOB_LOADING &&
                 task->reply_session == native_job.info.id && f->rdx == sizeof(struct fs_message)) {
@@ -343,8 +372,10 @@ static void syscall(struct task *task) {
             m->size = f->rdx;
             ++ep->count;
             ++sent;
-            if (fs_reply && f->rdx == 64)
+            if (fs_reply && f->rdx == 64) {
                 task->ipc_idle = true; /* The trusted server has finished this request. */
+                task->reply_create_probe = false;
+            }
         } else {
             if (!ep->count) {
                 f->rax = (uint64_t)(producer_alive(ep) ? -11 : -32);
@@ -368,6 +399,7 @@ static void syscall(struct task *task) {
                 task->reply_session = m->reply_session;
                 task->reply_endpoint = m->reply_endpoint;
                 task->reply_control = m->control;
+                task->reply_create_probe = m->create_probe;
             }
             ep->head = (ep->head + 1) % 8;
             --ep->count;
@@ -755,13 +787,26 @@ static bool valid_launch(const struct desktop_launch_request *q) {
 static long native_control(struct task *desktop, uint64_t op, uint64_t address, uint64_t bytes) {
     if (!desktop->desktop || current != 1)
         return -1;
-    if (op == NOS_JOB_START) {
+    if (op == NOS_JOB_START || op == NOS_JOB_START_SCOPED) {
         if (native_job.info.state != NOS_JOB_EMPTY || ai_job_active || task_count != 2)
             return -16;
-        if (bytes != sizeof(launch_request) ||
-            !user_copy_from(&desktop->space, &launch_request, address, sizeof(launch_request)))
+        struct nos_file_scope scope = {0};
+        struct desktop_launch_request request;
+        bool scoped = op == NOS_JOB_START_SCOPED;
+        if (scoped) {
+            struct nos_scoped_launch q;
+            if (bytes != sizeof(q))
+                return -22;
+            if (!user_copy_from(&desktop->space, &q, address, sizeof(q)))
+                return -14;
+            if (q.launch.flags || !fs_scope_valid(&q.files))
+                return -22;
+            request = q.launch;
+            scope = q.files;
+        } else if (bytes != sizeof(request) ||
+                   !user_copy_from(&desktop->space, &request, address, sizeof(request)))
             return -14;
-        if (!valid_launch(&launch_request))
+        if (!valid_launch(&request))
             return -22;
         if (!task_alive(&tasks[0]) || !tasks[0].ipc_idle || endpoints[0].count ||
             endpoints[1].count)
@@ -769,9 +814,12 @@ static long native_control(struct task *desktop, uint64_t op, uint64_t address, 
         uint64_t id = allocate_identity();
         if (!id)
             return -75;
+        launch_request = request;
         native_job.info = (struct native_job_info){
             .id = id, .state = NOS_JOB_LOADING, .result = {.kind = NOS_LAUNCH_LOAD_ERROR}};
-        native_job.files = (launch_request.flags & NOS_LAUNCH_FILES) != 0;
+        native_job.files = scoped || (launch_request.flags & NOS_LAUNCH_FILES) != 0;
+        native_job.scoped = scoped;
+        native_job.scope = scope;
         native_job.session_open = true;
         native_job.load_error = -5;
         native_job.load_deadline = timer_ticks() + 6000; /* Bounded loading wall time. */
@@ -889,6 +937,8 @@ static long loader_control(struct task *task, uint64_t op, uint64_t address, uin
     next.context = (struct cpu_context){.rip = entry, .cs = 0x33, .ss = 0x2b, .flags = 0x202,
         .rsp = USER_ELF_STACK_TOP - 16, .rdi = USER_STACK + 0x100};
     next.fs_session = native_job.info.id;
+    next.fs_scoped = native_job.scoped;
+    next.fs_scope = native_job.scope;
     if (native_job.files) {
         next.caps[1] = (struct capability){0, SEND};
         next.caps[2] = (struct capability){4, RECEIVE};
